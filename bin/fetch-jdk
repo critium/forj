@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Downloads the JDK forj is pinned to into .jdk/ and points .jdk/current at it.
+# The plugin uses javac internals, so the build always compiles with this exact JDK.
+set -euo pipefail
+FEATURE=28
+BUILD=18
+cd "$(dirname "$0")/.."
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  PLATFORM=macos-aarch64 ;;
+  Darwin-x86_64) PLATFORM=macos-x64 ;;
+  Linux-aarch64) PLATFORM=linux-aarch64 ;;
+  Linux-x86_64)  PLATFORM=linux-x64 ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+URL="https://download.java.net/java/early_access/jdk${FEATURE}/${BUILD}/GPL/openjdk-${FEATURE}-ea+${BUILD}_${PLATFORM}_bin.tar.gz"
+TARBALL=".jdk/openjdk-${FEATURE}-ea+${BUILD}.tar.gz"
+mkdir -p .jdk
+curl -fL -o "$TARBALL" "$URL"
+EXPECTED=$(curl -fsL "$URL.sha256" | awk '{print $1}')
+ACTUAL=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
+[ "$EXPECTED" = "$ACTUAL" ] || { echo "sha256 mismatch for $URL" >&2; exit 1; }
+tar -xzf "$TARBALL" -C .jdk && rm "$TARBALL"
+
+HOME_DIR=$(find .jdk -maxdepth 4 -type d -path "*jdk-${FEATURE}*" -name Home | head -1)
+[ -n "$HOME_DIR" ] || HOME_DIR=".jdk/jdk-${FEATURE}"
+ln -sfn "$(cd "$HOME_DIR" && pwd)" .jdk/current
+.jdk/current/bin/java -version

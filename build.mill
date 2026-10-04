@@ -1,0 +1,73 @@
+package build
+
+import mill.*
+import mill.api.BuildCtx
+import mill.javalib.*
+
+/**
+ * Every module compiles, tests and runs on the JDK in .jdk/current (fetched by bin/fetch-jdk).
+ * The plugin is tied to javac internals, so the JDK is pinned rather than left to the host.
+ */
+trait PinnedJdk extends JavaModule {
+  def javaHome = Task.Input {
+    val home = BuildCtx.workspaceRoot / ".jdk" / "current"
+    if (!os.exists(home / "bin" / "javac")) sys.error("missing pinned JDK: run bin/fetch-jdk")
+    Some(PathRef(home, quick = true))
+  }
+}
+
+/** javac internals the plugin compiles against. */
+val javacInternals = Seq("api", "code", "main", "parser", "tree", "util")
+  .map(p => s"--add-exports=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
+
+/** JVM flags for any JVM that runs javac with the plugin: it also swaps javac's parser factory. */
+val pluginJvmOptions = javacInternals ++ Seq("main", "util")
+  .map(p => s"--add-opens=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
+
+val junit = Seq(
+  mvn"org.junit.jupiter:junit-jupiter:5.13.4",
+  mvn"org.junit.platform:junit-platform-launcher:1.13.4"
+)
+
+/** Runtime API: forj/guard plus the JDK monad instances. No dependencies. */
+object core extends MavenModule with PinnedJdk
+
+/** The javac plugin that desugars comprehensions. */
+object plugin extends MavenModule with PinnedJdk {
+  def javacOptions = javacInternals
+  def jvmOptions = super.jvmOptions() ++ pluginJvmOptions
+
+  object test extends MavenTests with TestModule.Junit5 {
+    def moduleDeps = super.moduleDeps ++ Seq(core)
+    def mvnDeps = junit
+    def javacOptions = javacInternals
+    def forkArgs = pluginJvmOptions
+  }
+}
+
+/** Mix into any module whose sources use for comprehensions. */
+trait ForjModule extends MavenModule with PinnedJdk {
+  /** Print each rewritten comprehension during compilation. */
+  def forjDebug: T[Boolean] = false
+
+  def moduleDeps = super.moduleDeps ++ Seq(core)
+
+  // Mill launches the compiler JVM with these options, and that is where the plugin gets loaded
+  def jvmOptions = super.jvmOptions() ++ pluginJvmOptions
+
+  // On the compile classpath (not -processorpath) so javac finds it next to other
+  // plugins, such as the semanticdb plugin Metals relies on. Compile-time only.
+  def compileModuleDeps = super.compileModuleDeps ++ Seq(plugin)
+  // ...plus its META-INF/services entry, which Mill leaves off compile classpaths
+  def compileResources = super.compileResources() ++ plugin.resources()
+
+  def javacOptions = Task {
+    super.javacOptions() :+ (if (forjDebug()) "-Xplugin:Forj debug" else "-Xplugin:Forj")
+  }
+}
+
+object examples extends ForjModule {
+  object test extends MavenTests with ForjModule with TestModule.Junit5 {
+    def mvnDeps = junit
+  }
+}
