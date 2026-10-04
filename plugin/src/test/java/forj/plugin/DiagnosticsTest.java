@@ -37,7 +37,8 @@ class DiagnosticsTest {
         var out = Files.createTempDirectory("forj-test");
         var diagnostics = new DiagnosticCollector<JavaFileObject>();
         var task = ToolProvider.getSystemJavaCompiler().getTask(new StringWriter(), null, diagnostics,
-                List.of("-classpath", cp, "-processorpath", cp, "-Xplugin:Forj", "-d", out.toString()),
+                List.of("--enable-preview", "--source", "28", "-classpath", cp, "-processorpath", cp,
+                        "-Xplugin:Forj", "-d", out.toString()),
                 null, List.of(file));
         task.call();
         return diagnostics.getDiagnostics().stream()

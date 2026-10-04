@@ -100,12 +100,36 @@ dashboard.call();   // runs now; each call() runs it again
 
 ### Parallelism
 
-As with `IO`, a comprehension never runs steps in parallel by itself. In cats-effect you'd
-reach for `parMapN`, `parTupled`, `IO.both` or `parTraverse`. The Java equivalent is
-structured concurrency (`StructuredTaskScope`), which also cancels siblings on failure.
-forj doesn't have parallel helpers yet; they're planned as `Par.mapN(a, b, c, f)` and
-friends returning lazy `Callable`s. `StructuredTaskScope` is still a preview API in JDK 27
-and 28, so that will need `--enable-preview`. See `TODO.md`.
+As with `IO`, a comprehension never runs steps in parallel by itself. `forj.Par` is the
+`parMapN` family, built on structured concurrency (`StructuredTaskScope`):
+
+| cats-effect | forj |
+|---|---|
+| `(a, b, c).parMapN(f)` | `Par.mapN(a, b, c, f)` (2 to 4 tasks) |
+| `list.parTraverse(f)` | `Par.traverse(list, f)` |
+| `tasks.parSequence` | `Par.sequence(tasks)` |
+
+```java
+Callable<String> dashboard = forj {
+    parts <- Par.mapN(get("/profile/" + user), get("/orders/" + user), get("/recommendations/" + user), Parts::new);
+    shipping <- get("/shipping/" + itemCount(parts.orders()));   // sequential again: needs the orders
+} yield render(parts, shipping);
+```
+
+The cats-effect equivalent:
+
+```scala
+for {
+  parts    <- (getProfile(user), getOrders(user), getRecs(user)).parMapN(Parts.apply)
+  shipping <- getShipping(itemCount(parts.orders))
+} yield render(parts, shipping)
+```
+
+Like the cats-effect versions, these are lazy and structured: nothing runs until `call()`,
+each call runs the tasks on virtual threads in one scope, and a failure cancels the
+siblings and rethrows the failed task's exception. There is no tuple type, so the combining
+function usually builds a record. `StructuredTaskScope` is a preview API in JDK 27 and 28,
+so forj builds with `--enable-preview`.
 
 ## Things Scala does that forj doesn't (yet)
 

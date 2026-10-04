@@ -26,4 +26,5 @@ tar -xzf "$TARBALL" -C .jdk && rm "$TARBALL"
 HOME_DIR=$(find .jdk -maxdepth 4 -type d -path "*jdk-${FEATURE}*" -name Home | head -1)
 [ -n "$HOME_DIR" ] || HOME_DIR=".jdk/jdk-${FEATURE}"
 ln -sfn "$(cd "$HOME_DIR" && pwd)" .jdk/current
-.jdk/current/bin/java -version
+"$(dirname "$0")/make-preview-jdk"
+.jdk/preview/bin/java -version

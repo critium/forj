@@ -112,15 +112,6 @@ and `x <- e;` show up as syntax errors, and completion and hover don't work insi
   Teach it to load javac plugins from the build's `javacOptions`, or contribute an option
   upstream. Diagnostics already come from the Mill build over BSP and are correct.
 
-## Parallel combinators for Callable (cats-effect `parMapN` style)
-
-`forj` over `Callable` is lazy and sequential, like a `for` over cats-effect `IO`. Add explicit
-parallel helpers on `StructuredTaskScope`, still lazy (they return a `Callable`):
-`Par.mapN(a, b, c, (x, y, z) -> ...)`, `Par.both(a, b)`, `Par.traverse(list, f)`.
-One scope per call: fork all, join with "all successful or throw", failure cancels siblings.
-`StructuredTaskScope` is a preview API in JDK 27 and 28, so this needs `--enable-preview`
-(javac and runtime, set in `build.mill`).
-
 ## Later
 - Scala-style guards (`if cond` inside `forj { }`) instead of `guard(cond);`.
 - Semicolon-free generators (`x <- xs` ended by a newline) like Scala's braces syntax.

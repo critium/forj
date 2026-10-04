@@ -5,15 +5,36 @@ import mill.api.BuildCtx
 import mill.javalib.*
 
 /**
- * Every module compiles, tests and runs on the JDK in .jdk/current (fetched by bin/fetch-jdk).
- * The plugin is tied to javac internals, so the JDK is pinned rather than left to the host.
+ * Every module compiles, tests and runs on the pinned JDK (fetched by bin/fetch-jdk), with
+ * Java preview features on: the plugin is tied to javac internals, and forj.Par uses
+ * StructuredTaskScope, a preview API in JDK 27/28.
+ *
+ * .jdk/preview is that JDK with a `java` launcher that always adds --enable-preview, so every
+ * JVM Mill starts (compiler, tests, test discovery, runMain) has preview on, including ones
+ * Mill doesn't let us pass flags to.
  */
 trait PinnedJdk extends JavaModule {
   def javaHome = Task.Input {
-    val home = BuildCtx.workspaceRoot / ".jdk" / "current"
+    val home = BuildCtx.workspaceRoot / ".jdk" / "preview"
     if (!os.exists(home / "bin" / "javac")) sys.error("missing pinned JDK: run bin/fetch-jdk")
     Some(PathRef(home, quick = true))
   }
+}
+
+/** Appends `flags` unless already there (test modules inherit their parent's javacOptions). */
+def withFlags(options: Seq[String], flags: Seq[String]): Seq[String] =
+  if (options.containsSlice(flags)) options else options ++ flags
+
+trait ForjJava extends MavenModule with PinnedJdk {
+  def javacOptions = withFlags(super.javacOptions(), Seq("--enable-preview", "--source", "28"))
+}
+
+/** JUnit 5 tests; compiler options come from the enclosing module. */
+trait ForjTests extends PinnedJdk with TestModule.Junit5 {
+  def mvnDeps = super.mvnDeps() ++ Seq(
+    mvn"org.junit.jupiter:junit-jupiter:5.13.4",
+    mvn"org.junit.platform:junit-platform-launcher:1.13.4"
+  )
 }
 
 /** javac internals the plugin compiles against. */
@@ -24,29 +45,25 @@ val javacInternals = Seq("api", "code", "main", "parser", "tree", "util")
 val pluginJvmOptions = javacInternals ++ Seq("main", "util")
   .map(p => s"--add-opens=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
 
-val junit = Seq(
-  mvn"org.junit.jupiter:junit-jupiter:5.13.4",
-  mvn"org.junit.platform:junit-platform-launcher:1.13.4"
-)
-
-/** Runtime API: forj/guard plus the JDK monad instances. No dependencies. */
-object core extends MavenModule with PinnedJdk
+/** Runtime API: the JDK monad instances and Par. No dependencies. */
+object core extends ForjJava {
+  object test extends MavenTests with ForjTests
+}
 
 /** The javac plugin that desugars comprehensions. */
-object plugin extends MavenModule with PinnedJdk {
-  def javacOptions = javacInternals
+object plugin extends ForjJava {
+  def javacOptions = super.javacOptions() ++ javacInternals
   def jvmOptions = super.jvmOptions() ++ pluginJvmOptions
 
-  object test extends MavenTests with TestModule.Junit5 {
+  object test extends MavenTests with ForjTests {
     def moduleDeps = super.moduleDeps ++ Seq(core)
-    def mvnDeps = junit
-    def javacOptions = javacInternals
-    def forkArgs = pluginJvmOptions
+    def javacOptions = super.javacOptions() ++ javacInternals
+    def forkArgs = super.forkArgs() ++ pluginJvmOptions
   }
 }
 
 /** Mix into any module whose sources use for comprehensions. */
-trait ForjModule extends MavenModule with PinnedJdk {
+trait ForjModule extends ForjJava {
   /** Print each rewritten comprehension during compilation. */
   def forjDebug: T[Boolean] = false
 
@@ -62,12 +79,10 @@ trait ForjModule extends MavenModule with PinnedJdk {
   def compileResources = super.compileResources() ++ plugin.resources()
 
   def javacOptions = Task {
-    super.javacOptions() :+ (if (forjDebug()) "-Xplugin:Forj debug" else "-Xplugin:Forj")
+    withFlags(super.javacOptions(), Seq(if (forjDebug()) "-Xplugin:Forj debug" else "-Xplugin:Forj"))
   }
 }
 
 object examples extends ForjModule {
-  object test extends MavenTests with ForjModule with TestModule.Junit5 {
-    def mvnDeps = junit
-  }
+  object test extends MavenTests with ForjModule with ForjTests
 }

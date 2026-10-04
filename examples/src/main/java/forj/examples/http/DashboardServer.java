@@ -2,6 +2,7 @@ package forj.examples.http;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import forj.Par;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -15,18 +16,21 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * An HTTP API whose handler calls three downstream services and combines the answers
- * with a forj comprehension over {@link Callable}.
+ * An HTTP API whose handler calls three downstream services in parallel, then a fourth that
+ * needs one of their answers, and combines everything with a forj comprehension over
+ * {@link Callable}.
  *
  * <pre>
  * GET /dashboard/{user}  ->  GET /profile/{user}          \
- *                            GET /orders/{user}           |-- one after another
+ *                            GET /orders/{user}           |-- in parallel (Par.mapN)
  *                            GET /recommendations/{user}  /
+ *                            GET /shipping/{item count}   --- then, using the orders
  * </pre>
  *
  * Everything is lazy: {@link #dashboard} only describes the calls, and they happen when
- * the handler invokes {@code call()}, on the request's virtual thread. The downstream
- * services are served by this same process with an artificial {@link #LATENCY}.
+ * the handler invokes {@code call()}. {@link Par#mapN} then forks them in one
+ * StructuredTaskScope; if one fails, the others are cancelled. The downstream services are
+ * served by this same process with an artificial {@link #LATENCY}.
  *
  * <p>Run: {@code ./mill examples.runMain forj.examples.http.DashboardServer}, then
  * {@code curl localhost:8080/dashboard/ana}.
@@ -51,6 +55,8 @@ public final class DashboardServer implements AutoCloseable {
         server.createContext("/profile/", ex -> app.downstream(ex, user -> "{\"name\":\"" + user + "\"}"));
         server.createContext("/orders/", ex -> app.downstream(ex, user -> "[\"book\",\"lamp\"]"));
         server.createContext("/recommendations/", ex -> app.downstream(ex, user -> "[\"desk\"]"));
+        server.createContext("/shipping/", ex -> app.downstream(ex, items ->
+                "{\"items\":" + items + ",\"cents\":" + Integer.parseInt(items) * 499 + "}"));
         server.start();
         return app;
     }
@@ -73,15 +79,28 @@ public final class DashboardServer implements AutoCloseable {
         }
     }
 
+    record Parts(String profile, String orders, String recommendations) {}
+
     /** Describes the dashboard for {@code user}; no request is made until {@code call()}. */
     Callable<String> dashboard(String user) {
         return forj {
-            profile <- get("/profile/" + user);
-            orders <- get("/orders/" + user);
-            recommendations <- get("/recommendations/" + user);
-        } yield "{\"profile\":" + profile
-                + ",\"orders\":" + orders
-                + ",\"recommendations\":" + recommendations + "}";
+            parts <- Par.mapN(
+                    get("/profile/" + user),
+                    get("/orders/" + user),
+                    get("/recommendations/" + user),
+                    Parts::new);
+            shipping <- get("/shipping/" + itemCount(parts.orders()));   // needs the orders first
+        } yield "{\"profile\":" + parts.profile()
+                + ",\"orders\":" + parts.orders()
+                + ",\"recommendations\":" + parts.recommendations()
+                + ",\"shipping\":" + shipping + "}";
+    }
+
+    /** Items in a JSON array of strings, e.g. {@code ["book","lamp"]} has 2. */
+    static int itemCount(String jsonArray) {
+        String inner = jsonArray.strip();
+        inner = inner.substring(1, inner.length() - 1).strip();
+        return inner.isEmpty() ? 0 : inner.split(",").length;
     }
 
     private Callable<String> get(String path) {

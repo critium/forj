@@ -102,6 +102,43 @@ Steps run on the calling thread and simply block, which is cheap on a virtual th
 
 A failed `guard` makes `call()` throw `NoSuchElementException`.
 
+### Parallel calls with `Par`
+
+Generators always run one after another. To run calls at the same time, combine them with
+`forj.Par` and bind the combined result. Steps after it are sequential again, so a call that
+needs one of the parallel answers simply goes on the next line:
+
+```java
+record Parts(String profile, String orders, String recommendations) {}
+
+Callable<String> dashboard = forj {
+    parts <- Par.mapN(                                  // 1. three calls at once
+            get("/profile/" + user),
+            get("/orders/" + user),
+            get("/recommendations/" + user),
+            Parts::new);
+    shipping <- get("/shipping/" + itemCount(parts.orders()));   // 2. then one that needs the orders
+} yield render(parts, shipping);
+```
+
+With each call taking 200 ms, this takes about 400 ms: one round for the three parallel calls
+and one for shipping, instead of 800 ms for all four in a row. This is the example server in
+`examples/.../http/DashboardServer.java`.
+
+`Par` is still lazy: `Par.mapN` returns a `Callable`, and nothing starts until `call()`.
+Each call opens a `StructuredTaskScope`, runs every task on its own virtual thread, and
+waits for all of them. If one fails, the others are cancelled and `call()` throws that
+task's exception.
+
+| Method | Does |
+|---|---|
+| `Par.mapN(a, b, f)` (up to 4 tasks) | Runs the tasks in parallel, then combines the results with `f`. |
+| `Par.traverse(list, f)` | Runs `f` on every element in parallel; results keep the list's order. |
+| `Par.sequence(tasks)` | Runs a list of tasks in parallel; results keep the list's order. |
+
+`StructuredTaskScope` is a preview API in JDK 27 and 28, so forj builds with
+`--enable-preview`.
+
 ## Adding your own types
 
 Any generic type `M<A>` works if a statically imported class provides:

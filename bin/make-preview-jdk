@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Builds .jdk/preview: the JDK in .jdk/current, except that `java` always runs with
+# --enable-preview. forj uses preview APIs throughout, and some JVMs the build tool starts
+# (e.g. Mill's test pre-check) don't accept extra flags, so preview is set at the launcher.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REAL="$(cd .jdk/current && pwd -P)"
+rm -rf .jdk/preview
+mkdir -p .jdk/preview/bin
+for entry in "$REAL"/*; do
+  [ "$(basename "$entry")" = bin ] || ln -s "$entry" ".jdk/preview/$(basename "$entry")"
+done
+for tool in "$REAL"/bin/*; do
+  ln -s "$tool" ".jdk/preview/bin/$(basename "$tool")"
+done
+rm .jdk/preview/bin/java
+cat > .jdk/preview/bin/java <<SCRIPT
+#!/bin/sh
+exec "$REAL/bin/java" --enable-preview "\$@"
+SCRIPT
+chmod +x .jdk/preview/bin/java
