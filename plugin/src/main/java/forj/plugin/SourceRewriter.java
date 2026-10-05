@@ -102,7 +102,7 @@ final class SourceRewriter {
         String text = input.toString();
         boolean interpolates = Interpolations.mayContain(text);
         if (!interpolates && !text.contains("<-") && !text.contains(FORJ) && !text.contains(GIVEN)
-                && !text.contains(USING)) {
+                && !text.contains(USING) && !text.contains("<_>")) {
             return null;
         }
         List<Token> tokens = tokenize(text, scanners, log);
@@ -123,6 +123,7 @@ final class SourceRewriter {
         findArrows(tokens, edits);
         findGivens(tokens, edits);
         findUsings(tokens, edits);
+        findHigherKinds(tokens, edits);
         return edits.isEmpty() ? null : apply(text, edits);
     }
 
@@ -304,22 +305,30 @@ final class SourceRewriter {
     private static boolean[] classBodies(List<Token> tokens) {
         boolean[] result = new boolean[tokens.size()];
         boolean header = false;      // saw class/interface/enum/record since the last ; { }
-        int newParens = -1;          // paren depth of a `new X(` whose `)` may open a body
+        Deque<Integer> news = new ArrayDeque<>();   // paren depth of each open `new X(`
+        int newClosedAt = -1;        // index of the `)` that closed a `new X(...)`
         int parens = 0;
         for (int i = 0; i < tokens.size(); i++) {
             Token t = tokens.get(i);
             TokenKind prev = i > 0 ? tokens.get(i - 1).kind : null;
             switch (t.kind) {
                 case CLASS, INTERFACE, ENUM -> header |= prev != TokenKind.DOT;
-                case NEW -> newParens = parens;
+                case NEW -> news.push(parens);
                 case LPAREN -> parens++;
-                case RPAREN -> parens--;
+                case RPAREN -> {
+                    parens--;
+                    if (!news.isEmpty() && news.peek() == parens) {
+                        news.pop();
+                        newClosedAt = i;
+                    }
+                }
                 case LBRACE -> {
-                    boolean anonymous = prev == TokenKind.RPAREN && newParens == parens;
+                    // `new X(...) {` opens an anonymous class; `new int[] {` and method bodies don't
+                    boolean anonymous = newClosedAt == i - 1;
                     result[i] = header || anonymous;
                     header = false;
-                    if (anonymous) {
-                        newParens = -1;
+                    if (!news.isEmpty() && news.peek() == parens) {
+                        news.pop();   // `new int[] {...}` array initializer
                     }
                 }
                 case SEMI, RBRACE -> header = false;
@@ -394,6 +403,95 @@ final class SourceRewriter {
         }
         int at = tokens.get(end).pos;
         edits.add(new Edit(at, at, ") ", 0, Kind.TEXT));
+    }
+
+    // ------------------------------------------------------- F<_> and F<A>
+
+    /**
+     * Higher-kinded type parameters: {@code interface Functor<F<_>>} or
+     * {@code static <F<_>, A> F<A> pure(A a)}. The {@code <_>} is dropped, and in the
+     * parameter's scope (the class body, or the method) every {@code F<X>} becomes
+     * {@code forj.Kind<F, X>}.
+     */
+    private static void findHigherKinds(List<Token> tokens, List<Edit> edits) {
+        for (int i = 1; i + 3 < tokens.size(); i++) {
+            Token name = tokens.get(i);
+            TokenKind before = tokens.get(i - 1).kind;
+            TokenKind closer = tokens.get(i + 3).kind;
+            if (name.kind != TokenKind.IDENTIFIER || (before != TokenKind.LT && before != TokenKind.COMMA)
+                    || tokens.get(i + 1).kind != TokenKind.LT || tokens.get(i + 2).kind != TokenKind.UNDERSCORE
+                    || (closer != TokenKind.GT && closer != TokenKind.GTGT && closer != TokenKind.GTGTGT)) {
+                continue;
+            }
+            // drop `<_>`; in `<F<_>>` the tokenizer sees `>>` as one token, so only its first `>` goes
+            edits.add(new Edit(tokens.get(i + 1).pos, tokens.get(i + 3).pos + 1, "", 0, Kind.TEXT));
+            int listStart = typeParameterListStart(tokens, i);
+            int[] scope = higherKindScope(tokens, listStart);
+            if (scope == null) {
+                continue;
+            }
+            for (int j = scope[0]; j < scope[1]; j++) {
+                Token t = tokens.get(j);
+                if (j != i && t.kind == TokenKind.IDENTIFIER && t.name() == name.name()
+                        && j + 1 < tokens.size() && tokens.get(j + 1).kind == TokenKind.LT
+                        && tokens.get(j - 1).kind != TokenKind.DOT
+                        && !(j + 2 < tokens.size() && tokens.get(j + 2).kind == TokenKind.UNDERSCORE)) {
+                    edits.add(new Edit(t.pos, tokens.get(j + 1).endPos, "forj.Kind<" + t.name() + ", ", 0, Kind.TEXT));
+                }
+            }
+        }
+    }
+
+    /** Index of the {@code <} opening the type parameter list that contains index {@code i}. */
+    private static int typeParameterListStart(List<Token> tokens, int i) {
+        int depth = 0;
+        for (int j = i - 1; j >= 0; j--) {
+            switch (tokens.get(j).kind) {
+                case GT -> depth++;
+                case GTGT -> depth += 2;
+                case GTGTGT -> depth += 3;
+                case LT -> {
+                    if (depth-- == 0) {
+                        return j;
+                    }
+                }
+                default -> {}
+            }
+        }
+        return i - 1;
+    }
+
+    /**
+     * [from, to) token range where a higher-kinded parameter is in scope: for a class's
+     * parameter, its body; for a method's, the rest of the declaration up to the end of its
+     * body (or the {@code ;} of an abstract method).
+     */
+    private static int[] higherKindScope(List<Token> tokens, int listStart) {
+        boolean classLevel = listStart >= 2 && tokens.get(listStart - 1).kind == TokenKind.IDENTIFIER
+                && switch (tokens.get(listStart - 2).kind) {
+                    case CLASS, INTERFACE, ENUM -> true;
+                    default -> isName(tokens.get(listStart - 2), "record");
+                };
+        int parens = 0;
+        for (int j = listStart; j < tokens.size(); j++) {
+            switch (tokens.get(j).kind) {
+                case LPAREN -> parens++;
+                case RPAREN -> parens--;
+                case LBRACE -> {
+                    if (parens == 0) {
+                        int close = matchingBrace(tokens, j);
+                        return close < 0 ? null : new int[] {classLevel ? j : listStart, close};
+                    }
+                }
+                case SEMI -> {
+                    if (parens == 0 && !classLevel) {
+                        return new int[] {listStart, j};
+                    }
+                }
+                default -> {}
+            }
+        }
+        return null;
     }
 
     /** The first of {@code kinds} outside parentheses and type arguments, or null. */

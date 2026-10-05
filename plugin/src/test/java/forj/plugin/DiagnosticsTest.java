@@ -140,6 +140,33 @@ class DiagnosticsTest {
     }
 
     @Test
+    void aCapabilityTheEffectLacksIsACompileError() throws Exception {
+        // Callable is Sync, not Concurrent: asking for Concurrent<Callable> must not compile
+        var errors = errors("""
+                return needsConcurrent(new forj.data.CallableK<>(() -> 1));
+                }
+                static <F<_>> F<Integer> needsConcurrent(F<Integer> fa) using forj.typeclass.Concurrent<F> c {
+                    return fa;
+                """);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>")),
+                errors::toString);
+    }
+
+    @Test
+    void aGuardNeedsFunctorFilter() throws Exception {
+        // Callable has no FunctorFilter: there is nothing a failed guard could leave out
+        var errors = errors("""
+                java.util.concurrent.Callable<Integer> c = forj {
+                    x <- () -> 1;
+                    guard(x > 0);
+                } yield x;
+                return c;
+                """);
+        assertTrue(errors.stream().anyMatch(e -> e.contains("forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>")),
+                errors::toString);
+    }
+
+    @Test
     void mixingMonadsIsATypeError() throws Exception {
         // As in Scala, a List generator cannot be followed by an Optional one.
         assertTrue(!errors("""

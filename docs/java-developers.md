@@ -141,23 +141,108 @@ task's exception.
 
 ## Adding your own types
 
-Any generic type `M<A>` works if a statically imported class provides:
+A comprehension over a type `M` needs a `given Monad<M>` (plus `FunctorFilter<M>` if it uses
+`guard`). How much more depends on whether you own `M`:
+
+- **You own it:** make it a `Kind` of itself, `final class Box<A> implements Kind<Box, A>`,
+  and declare `given Monad<Box> monad = ...` inside `Box`. Every caller finds it, no imports.
+- **You don't** (like `java.util.stream.Stream`): wrap it, and provide a `forjLift` overload
+  to wrap and a `@Lower` method to unwrap, next to the given:
 
 ```java
-public static <A, B> M<B> forjFlatMap(M<A> m, Function<? super A, ? extends M<B>> f)
-public static <A, B> M<B> forjMap(M<A> m, Function<? super A, ? extends B> f)
-public static <A>    M<A> forjFilter(M<A> m, Predicate<? super A> p)   // only needed for guard
+public final class StreamMonad {
+    record StreamK<A>(Stream<A> stream) implements Kind<Stream, A> {}
+
+    public static <A> Kind<Stream, A> forjLift(Stream<A> s) { return new StreamK<>(s); }
+
+    @Lower
+    public static <A> Stream<A> lowerStream(Kind<Stream, A> k) { return ((StreamK<A>) k).stream(); }
+
+    given Monad<Stream> monad = new Monad<>() { ... pure, flatMap ... };
+}
 ```
 
-`examples/.../StreamMonad.java` does this for `Stream` in a dozen lines. Use it with:
+Callers `import static forj.examples.StreamMonad.*;` and write comprehensions over streams.
+The full example is `examples/.../StreamMonad.java`.
+
+## Higher-kinded types: `F<_>`
+
+Java can't say "some `F<A>` where `F` is itself a parameter". forj can: write `F<_>` where
+the type parameter is declared, then use `F<A>` like any generic type.
 
 ```java
-import static forj.examples.StreamMonad.*;
+interface Functor<F<_>> {                                    // F takes a type
+    <A, B> F<B> map(F<A> fa, Function<? super A, ? extends B> f);
+}
+
+static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b) using Monad<F> m {
+    return forj { x <- a; y <- b; } yield x + y;             // one comprehension, any monad
+}
 ```
 
-No plugin changes are needed: the generated code calls `forjFlatMap(...)` unqualified,
-and javac's normal overload resolution picks the right one from your static imports.
-The JDK types (`Optional`, `List`, `Callable`) are imported automatically.
+Under the hood `F<A>` is `forj.Kind<F, A>`, and `F` is the raw class standing for the type
+constructor (`List`, `Optional`, `IO`). `addBoth` works for lists (every combination),
+optionals (both or nothing) and `IO` (one after the other, when run). See
+`examples/.../hkt/Generic.java`.
+
+## Effects: `IO` and the capability ladder
+
+`forj.effect.IO<A>` is a lazy description of a computation that may perform side effects:
+
+```java
+IO<String> greeting = IO.delay(() -> readName()).map(n -> s"Hi $n");
+greeting.unsafeRunSync();          // runs now; each run starts over
+```
+
+It is stack safe (a million chained `flatMap`s are fine) and runs on virtual threads:
+`start()` runs it as a fiber you can `join` or `cancel`, `IO.race` keeps the first result and
+cancels the other, `IO.parMap2` runs two at once. `IO.bracket` releases a resource whether the
+use succeeds, fails or is cancelled.
+
+Generic code asks for capabilities, from the least to the most:
+
+| Type class | Adds | Example need |
+|---|---|---|
+| `Functor` | `map` | transform a result |
+| `Applicative` | `pure`, `map2` | combine independent results |
+| `Monad` | `flatMap` | the next step depends on the last (comprehensions) |
+| `MonadError<F, E>` | `raiseError`, `handleErrorWith`, `attempt` | fail and recover |
+| `Bracket<F, E>` | `bracket`, `guarantee` | release resources |
+| `Sync` | `delay`, `suspend` | wrap side effects |
+| `Async` | `async` | wait for a callback |
+| `Concurrent` | `start`, `race`, `parMap2` | do things at the same time |
+
+Each extends the one above it. `IO` has them all; `Callable` stops at `Sync`. Asking for a
+capability the effect doesn't have is a compile error.
+
+## Tagless final
+
+Describe what a program needs as small interfaces generic in `F` ("algebras"), write the
+program against those plus the capabilities it uses, and choose `F` only at the edge:
+
+```java
+public interface Inventory<F<_>> {
+    F<Integer> stock(String item);
+    F<Unit> reserve(String item, int quantity);
+}
+
+static <F<_>> F<Receipt> checkout(Order order) using Sync<F> sync, Inventory<F> inventory, Payments<F> payments {
+    return forj { ... } yield new Receipt(order, transaction);
+}
+```
+
+An interpreter implements the algebra for one effect, `class Warehouse implements
+Inventory<IO>`, whose methods can return `IO<Integer>` directly. At the edge, declare the
+interpreters as givens and ask for the type you want:
+
+```java
+given Inventory<IO> inventory = new Live.Warehouse(stock);
+given Payments<IO> payments = new Live.Bank();
+IO<Receipt> program = checkout(order);      // F = IO, inferred from the target
+```
+
+`examples/.../tagless/` runs the same `checkout` in `IO` and in plain `Callable`, and has
+`Ladder.java` with one function per capability level.
 
 ## String interpolation
 
@@ -381,9 +466,9 @@ forj: forj { ... } must be followed by yield <expr>
 forj: yield goes after the block: forj { ... } yield expr
 ```
 
-Type errors come from javac in terms of the generated calls. For example, using a type
-with no instance mentions `forjMap` or `forjFlatMap`: it means no static import provides
-those methods for that type.
+Missing instances are reported by type: `forj: no given forj.typeclass.Monad<...>` means no
+given provides that capability for the type. Using a type forj can't lift at all (no
+`forjLift` overload and not a `Kind`) shows up as a javac error about `forjLift`.
 
 ## Seeing what it generates
 
@@ -392,10 +477,12 @@ Each comprehension is printed after desugaring:
 
 ```
 [forj] Examples.java:41
-forj.For.run(()->{
-    return forjFlatMap(findUser(name), (user)->{
-        return forjFlatMap(user.managerName(), (manager)->{
-            return forjMap(findAddress(manager), (address)->{
-                return address.city();
+forjLower(forj.For.forjFlatMap(forjLift(findUser(name)), (user)->{
+    return forj.For.forjFlatMap(forjLift(user.managerName()), (manager)->{
+        return forj.For.forjMap(forjLift(findAddress(manager)), (address)->{
+            return address.city();
             ...
 ```
+
+The instance arguments (`forj.Instances.optional`) and type arguments are added afterwards,
+once javac knows the types.

@@ -46,6 +46,18 @@ public final class ForjPlugin implements Plugin {
         Log log = Log.instance(context);
         Map<JavaFileObject, SourceRewriter.Result> rewrites = new HashMap<>();
         ForjParserFactory.install(context, rewrites);
+        if (Boolean.getBoolean("forj.trace")) {
+            // where does javac report each error from?
+            log.new DiagnosticHandler() {
+                @Override
+                protected void reportReady(com.sun.tools.javac.util.JCDiagnostic d) {
+                    if (d.getKind() == javax.tools.Diagnostic.Kind.ERROR) {
+                        new Throwable("[forj.trace] error: " + d.getMessage(null)).printStackTrace();
+                    }
+                    prev.report(d);
+                }
+            };
+        }
 
         List<JCCompilationUnit> parsed = new ArrayList<>();
         ImplicitResolver[] implicits = {null};

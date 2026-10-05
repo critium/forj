@@ -19,6 +19,7 @@ import com.sun.tools.javac.code.Type.ArrayType;
 import com.sun.tools.javac.code.Type.TypeVar;
 import com.sun.tools.javac.code.Type.WildcardType;
 import com.sun.tools.javac.code.Types;
+import com.sun.tools.javac.comp.ArgumentAttr;
 import com.sun.tools.javac.comp.Attr;
 import com.sun.tools.javac.comp.AttrContext;
 import com.sun.tools.javac.comp.Env;
@@ -29,6 +30,10 @@ import com.sun.tools.javac.tree.JCTree.JCCompilationUnit;
 import com.sun.tools.javac.tree.JCTree.JCExpression;
 import com.sun.tools.javac.tree.JCTree.JCFieldAccess;
 import com.sun.tools.javac.tree.JCTree.JCImport;
+import com.sun.tools.javac.tree.JCTree.JCAssign;
+import com.sun.tools.javac.tree.JCTree.JCBlock;
+import com.sun.tools.javac.tree.JCTree.JCLambda;
+import com.sun.tools.javac.tree.JCTree.JCReturn;
 import com.sun.tools.javac.tree.JCTree.JCMethodDecl;
 import com.sun.tools.javac.tree.JCTree.JCMethodInvocation;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
@@ -72,16 +77,26 @@ import javax.tools.Diagnostic;
  *   <li>givens declared in the enclosing classes (and their supertypes);</li>
  *   <li>givens imported with {@code import static};</li>
  *   <li>givens in the type class's own class and in the classes of its type arguments
- *       (Scala's implicit scope, the closest Java has to companion objects).</li>
+ *       (Scala's implicit scope, the closest Java has to companion objects);</li>
+ *   <li>{@code forj.Instances}: instances for JDK types.</li>
  * </ol>
  * The inserted arguments are ordinary Java, so javac type checks them like any other code.
  */
 final class ImplicitResolver {
 
     private static final int MAX_DEPTH = 16;
+    private static final boolean TRACE = Boolean.getBoolean("forj.trace");
+
+    private static void trace(String message) {
+        if (TRACE) {
+            System.err.println("[forj.trace] " + message);
+        }
+    }
 
     private final Trees trees;
     private final Attr attr;
+    private final ArgumentAttr argumentAttr;
+    private final java.lang.reflect.Field argumentCache;
     private final Types types;
     private final Resolve rs;
     private final Log log;
@@ -90,9 +105,19 @@ final class ImplicitResolver {
     private final ClassSymbol givenAnnotation;
     private final ClassSymbol usingAnnotation;
     private final javax.lang.model.util.Elements elements;
+    private final ClassSymbol lowerAnnotation;
+    private final ClassSymbol kindSymbol;
+    private final ClassSymbol forClass;
+    private final ClassSymbol defaultInstances;
+    private final Name forjLower;
+    private final Name forjLift;
+
+    private enum Outcome { SKIPPED, RESOLVED, PENDING }
 
     /** Names of methods known to take {@code using} parameters; calls to anything else are skipped quickly. */
     private final Set<Name> usingMethodNames = new java.util.HashSet<>();
+    /** Names of methods known to return a {@code Kind}: their results get narrowed where assigned or returned. */
+    private final Set<Name> kindMethodNames = new java.util.HashSet<>();
     private final Set<Name> indexedPackages = new java.util.HashSet<>();
 
     ImplicitResolver(Context context, Trees trees, javax.lang.model.util.Elements elements,
@@ -100,6 +125,13 @@ final class ImplicitResolver {
         this.elements = elements;
         this.trees = trees;
         this.attr = Attr.instance(context);
+        this.argumentAttr = ArgumentAttr.instance(context);
+        try {
+            this.argumentCache = ArgumentAttr.class.getDeclaredField("argumentTypeCache");
+            argumentCache.setAccessible(true);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("forj: needs --add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED", e);
+        }
         this.types = Types.instance(context);
         this.rs = Resolve.instance(context);
         this.log = Log.instance(context);
@@ -107,7 +139,17 @@ final class ImplicitResolver {
         this.names = Names.instance(context);
         this.givenAnnotation = givenAnnotation;
         this.usingAnnotation = usingAnnotation;
-        usingMethodNames.add(names.fromString("summon"));
+        this.lowerAnnotation = (ClassSymbol) elements.getTypeElement("forj.Lower");
+        this.kindSymbol = (ClassSymbol) elements.getTypeElement("forj.Kind");
+        this.forClass = (ClassSymbol) elements.getTypeElement("forj.For");
+        this.defaultInstances = (ClassSymbol) elements.getTypeElement("forj.Instances");
+        this.forjLower = names.fromString("forjLower");
+        this.forjLift = names.fromString("forjLift");
+        for (String name : List.of("forj.For", "forj.Implicits")) {
+            if (elements.getTypeElement(name) instanceof ClassSymbol c) {
+                indexMembers(c);
+            }
+        }
     }
 
     /** Records methods in a parsed file that declare {@code @forj.Using} parameters. */
@@ -115,6 +157,9 @@ final class ImplicitResolver {
         new com.sun.tools.javac.tree.TreeScanner() {
             @Override
             public void visitMethodDef(JCMethodDecl tree) {
+                if (tree.restype != null && tree.restype.toString().matches("(forj\\.)?Kind<.*")) {
+                    kindMethodNames.add(tree.name);
+                }
                 for (JCVariableDecl p : tree.params) {
                     if (p.mods.annotations.stream().anyMatch(a -> a.annotationType.toString().endsWith("Using"))) {
                         usingMethodNames.add(tree.name);
@@ -132,17 +177,59 @@ final class ImplicitResolver {
             return;
         }
         indexImports(unit);
+        // A call can only be resolved once its arguments' types are known, and inside a lambda
+        // those can depend on resolving the enclosing call first (nested comprehensions), and
+        // resolving a step lets the next pass write out its type arguments. So: passes until
+        // nothing changes, then a last pass that reports what is still missing.
+        while (true) {
+            int[] counts = pass(unit, classPath, false);
+            if (counts[0] == 0) {           // no progress: report whatever is still missing
+                if (counts[1] > 0) {
+                    pass(unit, classPath, true);
+                }
+                break;
+            }
+        }
+        if (TRACE) {
+            trace("resolved class:\n" + classPath.getLeaf());
+        }
+    }
+
+    /** One pass over a class; returns {resolved, pending}. */
+    private int[] pass(JCCompilationUnit unit, TreePath classPath, boolean report) {
+        int[] counts = {0, 0};
         new TreePathScanner<Void, Void>() {
             @Override
             public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
                 super.visitMethodInvocation(node, unused); // innermost calls first
                 var call = (JCMethodInvocation) node;
-                if (usingMethodNames.contains(TreeInfo.name(call.meth))) {
-                    new CallSite(unit, getCurrentPath(), call).complete();
+                Name name = TreeInfo.name(call.meth);
+                Outcome outcome = Outcome.SKIPPED;
+                if (name == forjLower && call.args.size() == 1) {
+                    outcome = new CallSite(unit, getCurrentPath(), call).lower();
+                } else if (name == forjLift && call.args.size() == 1 && call.meth instanceof com.sun.tools.javac.tree.JCTree.JCIdent) {
+                    outcome = new CallSite(unit, getCurrentPath(), call).liftKind();
+                } else if (isUnpinnedStep(call, name)) {
+                    outcome = new CallSite(unit, getCurrentPath(), call).pinTypeArguments();
+                } else if (usingMethodNames.contains(name)) {
+                    outcome = new CallSite(unit, getCurrentPath(), call).complete(report);
+                }
+                if (outcome != Outcome.PENDING && kindMethodNames.contains(name) && narrowable(getCurrentPath())
+                        && new CallSite(unit, getCurrentPath(), call).narrow()) {
+                    outcome = Outcome.RESOLVED;
+                }
+                if (outcome != Outcome.SKIPPED || TRACE) {
+                    trace((report ? "report " : "pass ") + outcome + " " + call);
+                }
+                if (outcome == Outcome.RESOLVED) {
+                    counts[0]++;
+                } else if (outcome == Outcome.PENDING) {
+                    counts[1]++;
                 }
                 return null;
             }
         }.scan(classPath, null);
+        return counts;
     }
 
     /**
@@ -172,10 +259,19 @@ final class ImplicitResolver {
 
     private void indexMembers(ClassSymbol c) {
         for (Symbol m : c.members().getSymbols()) {
-            if (m instanceof MethodSymbol method && usingCount(method) > 0) {
-                usingMethodNames.add(method.name);
+            if (m instanceof MethodSymbol method) {
+                if (usingCount(method) > 0) {
+                    usingMethodNames.add(method.name);
+                }
+                if (returnsKind(method)) {
+                    kindMethodNames.add(method.name);
+                }
             }
         }
+    }
+
+    private boolean returnsKind(MethodSymbol m) {
+        return kindSymbol != null && m.type.getReturnType().tsym == kindSymbol;
     }
 
     // ------------------------------------------------------------------ one call
@@ -191,7 +287,16 @@ final class ImplicitResolver {
             this.unit = unit;
             this.call = call;
             this.path = path;
-            this.scope = (JavacScope) trees.getScope(path);
+            // getScope type checks a copy of the enclosing statement, which in half-resolved code
+            // has errors; they are not real, so neither reported nor cached
+            Object saved = swapArgumentCache(new HashMap<>());
+            Log.DiagnosticHandler discard = log.new DiscardDiagnosticHandler();
+            try {
+                this.scope = (JavacScope) trees.getScope(path);
+            } finally {
+                log.popDiagnosticHandler(discard);
+                swapArgumentCache(saved);
+            }
             this.env = scope.getEnv();
         }
 
@@ -221,7 +326,8 @@ final class ImplicitResolver {
             return found;
         }
 
-        void complete() {
+        Outcome complete(boolean report) {
+            this.report = report;
             Name name = TreeInfo.name(call.meth);
             List<MethodSymbol> candidates = new ArrayList<>();
             boolean plainOverload = false;
@@ -236,41 +342,269 @@ final class ImplicitResolver {
                 }
             }
             if (plainOverload || candidates.isEmpty()) {
-                return; // an ordinary call; javac handles it
+                return Outcome.SKIPPED; // an ordinary call; javac handles it
             }
             if (candidates.size() > 1) {
-                error(call, "ambiguous call: " + candidates.size() + " methods named " + name + " take using parameters");
-                return;
+                return error(call, "ambiguous call: " + candidates.size() + " methods named " + name + " take using parameters");
             }
             MethodSymbol method = candidates.getFirst();
             if (!usingParamsTrail(method)) {
-                error(call, "using parameters of " + method + " must come last");
-                return;
+                return error(call, "using parameters of " + method + " must come last");
             }
 
             Map<TypeVar, Type> bindings = inferTypeArguments(method);
-            if (bindings == null) {
-                return;
+            if (method.type.getTypeArguments().stream().anyMatch(tv -> !bindings.containsKey((TypeVar) tv))) {
+                Type target = targetType();
+                if (target != null && !target.isErroneous()) {
+                    unify(method.type.getReturnType(), target, bindings, method.type.getTypeArguments());
+                }
             }
+            trace("  args " + argTypes() + " bindings " + bindings);
             ListBuffer<JCExpression> given = new ListBuffer<>();
             List<VarSymbol> params = method.params();
             List<Type> paramTypes = method.type.getParameterTypes();
             for (int i = call.args.size(); i < params.size(); i++) {
                 Type required = substitute(paramTypes.get(i), bindings);
-                if (hasUnbound(required, method)) {
-                    error(call, "cannot infer the type of using parameter " + params.get(i).name + " (" + required
+                if (hasUnbound(required, method, bindings)) {
+                    return error(call, "cannot infer the type of using parameter " + params.get(i).name + " (" + required
                             + ") of " + method.name + "; pass type arguments explicitly, e.g. Owner.<T>" + method.name + "(...)");
-                    return;
                 }
                 Search search = new Search();
                 JCExpression found = search.find(required, 0);
                 if (found == null) {
-                    error(call, search.failure(required, method));
-                    return;
+                    return error(call, search.failure(required, method));
                 }
                 given.append(found);
             }
             call.args = call.args.appendList(given.toList());
+            if (method.owner == forClass) {
+                typeLambdaParameters(method, bindings);
+            }
+            return Outcome.RESOLVED;
+        }
+
+        /**
+         * Gives the implicit lambda parameters of a resolved comprehension step their types
+         * ({@code x -> ...} becomes {@code (String x) -> ...}). javac can then type the lambda
+         * body on its own, which nested steps need: until the enclosing generic call is fully
+         * inferred, javac only has an inference variable for {@code x}.
+         */
+        private void typeLambdaParameters(MethodSymbol method, Map<TypeVar, Type> bindings) {
+            List<Type> paramTypes = method.type.getParameterTypes();
+            for (int i = 0; i < call.args.size() && i < paramTypes.size(); i++) {
+                if (!(call.args.get(i) instanceof JCLambda lambda)
+                        || lambda.paramKind != JCLambda.ParameterKind.IMPLICIT) {
+                    continue;
+                }
+                List<Type> inputs = descriptorInputs(substitute(paramTypes.get(i), bindings));
+                if (inputs == null || inputs.size() != lambda.params.size()
+                        || inputs.stream().anyMatch(t -> hasUnbound(t, method, bindings) || !isPlain(t))) {
+                    continue;
+                }
+                for (int k = 0; k < inputs.size(); k++) {
+                    JCVariableDecl p = lambda.params.get(k);
+                    make.at(p.pos);
+                    p.vartype = typeTree(inputs.get(k));
+                    p.declKind = JCVariableDecl.DeclKind.EXPLICIT;
+                }
+                lambda.paramKind = JCLambda.ParameterKind.EXPLICIT;
+            }
+        }
+
+        /**
+         * {@code forjLift(e)} where {@code e} already is a {@code Kind}: call the one identity
+         * method instead. With a generic {@code e} (say {@code either.fold(...)}) javac can't
+         * choose between the {@code forjLift} overloads.
+         */
+        Outcome liftKind() {
+            Type arg = argTypes().getFirst();
+            if (arg == null) {
+                return Outcome.PENDING;
+            }
+            if (types.asSuper(arg, kindSymbol) == null) {
+                return Outcome.SKIPPED;
+            }
+            make.at(call.meth.pos);
+            call.meth = make.Select(qualified(forClass), names.fromString("forjKind"));
+            return Outcome.RESOLVED;
+        }
+
+        /**
+         * Wraps a call returning a {@code Kind} in {@code forj.For.forjNarrow(...)}, so its
+         * value can be assigned or returned as the type it stands for ({@code IO<Unit>}).
+         */
+        boolean narrow() {
+            Name name = TreeInfo.name(call.meth);
+            boolean returnsKind = false;
+            for (Symbol s : methodsNamed(name)) {
+                if (s instanceof MethodSymbol m && m.params().size() == call.args.size() && m.owner != forClass) {
+                    returnsKind |= returnsKind(m);   // forj's own plumbing is never narrowed
+                }
+            }
+            if (!returnsKind) {
+                return false;
+            }
+            make.at(call.meth.pos);
+            JCExpression wrapped = make.Apply(com.sun.tools.javac.util.List.nil(),
+                    make.Select(qualified(forClass), names.fromString("forjNarrow")),
+                    com.sun.tools.javac.util.List.of(call));
+            switch (path.getParentPath().getLeaf()) {
+                case JCVariableDecl v -> v.init = wrapped;
+                case JCReturn r -> r.expr = wrapped;
+                case JCAssign a -> a.rhs = wrapped;
+                default -> {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * The type the call's value goes into, if its context says: a typed local variable, a
+         * return from the enclosing method, or an assignment. Used to infer type parameters
+         * that only the result mentions ({@code IO<Unit> app = checkout(cart);} gives F = IO).
+         */
+        private Type targetType() {
+            TreePath parent = path.getParentPath();
+            if (parent.getLeaf() instanceof JCMethodInvocation wrapper
+                    && TreeInfo.name(wrapper.meth).contentEquals("forjNarrow")) {
+                parent = parent.getParentPath();
+            }
+            return switch (parent.getLeaf()) {
+                case JCVariableDecl v when v.vartype != null && !v.declaredUsingVar() -> speculate(v.vartype, true);
+                case JCReturn r -> insideLambda(parent) || env.enclMethod == null || env.enclMethod.sym == null
+                        ? null : env.enclMethod.sym.type.getReturnType();
+                case JCAssign a -> speculate(a.lhs, false);
+                default -> null;
+            };
+        }
+
+        private boolean insideLambda(TreePath from) {
+            for (TreePath p = from; p != null; p = p.getParentPath()) {
+                if (p.getLeaf() instanceof JCLambda) {
+                    return true;
+                }
+                if (p.getLeaf() instanceof JCMethodDecl) {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Writes out the type arguments of a resolved comprehension step,
+         * {@code forj.For.<F, A, B>forjMap(...)}. Without them javac infers them, and nested
+         * steps whose lambdas capture outer bindings are more than its inference recovers from.
+         * F and A come from the first argument, B from the type of the expression the lambda
+         * returns (for flatMap, the B of the {@code Kind<F, B>} it returns).
+         */
+        Outcome pinTypeArguments() {
+            Type fa = argTypes().getFirst();
+            Type kind = fa == null ? null : types.asSuper(fa, kindSymbol);
+            if (kind == null || kind.getTypeArguments().size() != 2) {
+                return Outcome.PENDING;
+            }
+            Type f = kind.getTypeArguments().get(0);
+            Type a = kind.getTypeArguments().get(1);
+            Name name = TreeInfo.name(call.meth);
+            ListBuffer<Type> typeArgs = new ListBuffer<Type>().append(f).append(a);
+            if (!name.contentEquals("forjFilter")) {
+                Type returned = returnedType((JCLambda) call.args.get(1));
+                if (returned == null) {
+                    return Outcome.PENDING;
+                }
+                Type b;
+                if (name.contentEquals("forjFlatMap")) {
+                    Type inner = types.asSuper(returned, kindSymbol);
+                    if (inner == null || inner.getTypeArguments().size() != 2) {
+                        return Outcome.PENDING;
+                    }
+                    b = inner.getTypeArguments().get(1);
+                } else {
+                    b = returned.isPrimitive() ? types.boxedClass(returned).type : returned;
+                }
+                typeArgs.append(b);
+            }
+            if (typeArgs.stream().anyMatch(t -> !isPlain(t))) {
+                return Outcome.SKIPPED; // leave it to javac's inference
+            }
+            ListBuffer<JCExpression> trees = new ListBuffer<>();
+            for (Type t : typeArgs) {
+                trees.append(typeTree(t));
+            }
+            call.typeargs = trees.toList();
+            return Outcome.RESOLVED;
+        }
+
+        /** The type of what a comprehension step's lambda returns, type checked in its own scope. */
+        private Type returnedType(JCLambda lambda) {
+            JCExpression result = lambda.body instanceof JCBlock block && block.stats.last() instanceof JCReturn ret
+                    ? ret.expr
+                    : lambda.body instanceof JCExpression e ? e : null;
+            if (result == null || lambda.paramKind != JCLambda.ParameterKind.EXPLICIT) {
+                return null;
+            }
+            TreePath at = trees.getPath(unit, result);
+            if (at == null) {
+                return null;
+            }
+            Type t = new CallSite(unit, at, null).speculate(result, false);
+            return t == null || t.isErroneous() ? null : t;
+        }
+
+        /**
+         * {@code forjLower(k)} where {@code k} is a {@code Kind<W, A>} for a concrete witness
+         * {@code W} with a {@code @Lower} method: call that method instead, so the result is a
+         * plain {@code List<A>}, {@code Optional<A>}, ... rather than a {@code Kind}.
+         */
+        Outcome lower() {
+            Type arg = argTypes().getFirst();
+            if (arg == null) {
+                return Outcome.PENDING;
+            }
+            Type kind = kindSymbol == null ? null : types.asSuper(arg, kindSymbol);
+            if (kind == null || kind.getTypeArguments().isEmpty()) {
+                return Outcome.SKIPPED;
+            }
+            Type witness = kind.getTypeArguments().head;
+            if (witness instanceof TypeVar) {
+                return Outcome.SKIPPED; // generic F: the identity forjLower is right
+            }
+            for (Symbol s : lowerCandidates()) {
+                if (s instanceof MethodSymbol m && m.params().size() == 1) {
+                    Type param = types.asSuper(m.type.getParameterTypes().head, kindSymbol);
+                    if (param != null && param.getTypeArguments().nonEmpty()
+                            && types.isSameType(types.erasure(param.getTypeArguments().head), types.erasure(witness))) {
+                        make.at(call.meth.pos);
+                        call.meth = make.Select(qualified((ClassSymbol) m.owner), m.name);
+                        return Outcome.RESOLVED;
+                    }
+                }
+            }
+            return Outcome.SKIPPED;
+        }
+
+        private List<Symbol> lowerCandidates() {
+            List<Symbol> found = new ArrayList<>();
+            if (lowerAnnotation == null) {
+                return found;
+            }
+            List<Symbol> scope = new ArrayList<>();
+            if (forClass != null) {
+                forClass.members().getSymbols().forEach(scope::add);
+            }
+            unit.namedImportScope.getSymbols().forEach(scope::add);
+            for (Symbol s : unit.starImportScope.getSymbols()) {
+                if (s.kind == Kind.MTH) {
+                    scope.add(s);
+                }
+            }
+            for (Symbol s : scope) {
+                if (s.kind == Kind.MTH && s.attribute(lowerAnnotation) != null) {
+                    found.add(s);
+                }
+            }
+            return found;
         }
 
         private List<Type> argTypes;
@@ -376,18 +710,33 @@ final class ImplicitResolver {
         private Type speculate(JCTree tree, boolean asType) {
             JCTree copy = new TreeCopier<Void>(make).copy(tree);
             Env<AttrContext> scratch = env.dup(copy); // env is getScope's private copy already
-            Log.DiagnosticHandler discard = log.new DiscardDiagnosticHandler();
+            var discard = TRACE ? log.new DeferredDiagnosticHandler() : log.new DiscardDiagnosticHandler();
+            Object saved = swapArgumentCache(new HashMap<>());
             try {
-                return asType ? attr.attribType(copy, scratch) : attr.attribExpr(copy, scratch);
+                Type t = asType ? attr.attribType(copy, scratch) : attr.attribExpr(copy, scratch);
+                if (TRACE && (t == null || t.isErroneous()) && discard instanceof Log.DeferredDiagnosticHandler d) {
+                    trace("    speculate " + tree + " -> " + t + " " + d.getDiagnostics().stream().map(x -> x.getMessage(null)).toList()
+                            + " locals " + scope.getLocalElements());
+                }
+                return t;
             } catch (RuntimeException e) {
+                trace("    speculate " + tree + " threw " + e);
                 return null;
             } finally {
+                swapArgumentCache(saved);
                 log.popDiagnosticHandler(discard);
             }
         }
 
-        private void error(JCTree at, String message) {
+        private boolean report;
+
+        /** Reports in the final pass; earlier passes just wait for more types to be known. */
+        private Outcome error(JCTree at, String message) {
+            if (!report) {
+                return Outcome.PENDING;
+            }
             trees.printMessage(Diagnostic.Kind.ERROR, "forj: " + message, at, unit);
+            return Outcome.SKIPPED;
         }
 
         // ------------------------------------------------------------ the search
@@ -447,7 +796,7 @@ final class ImplicitResolver {
                 Map<TypeVar, Type> bindings = new HashMap<>();
                 unify(m.type.getReturnType(), required, bindings, tvars);
                 Type result = substitute(m.type.getReturnType(), bindings);
-                if (hasUnbound(result, m) || !types.isSubtype(result, required)) {
+                if (hasUnbound(result, m, bindings) || !types.isSubtype(result, required)) {
                     return null;
                 }
                 ListBuffer<JCExpression> args = new ListBuffer<>();
@@ -461,8 +810,18 @@ final class ImplicitResolver {
                     }
                     args.append(arg);
                 }
+                // Explicit type arguments: then javac doesn't treat the call as a poly expression,
+                // which it would cache by source position (shared with the call we insert into).
+                ListBuffer<JCExpression> typeArgs = new ListBuffer<>();
+                for (Type tv : tvars) {
+                    Type bound = bindings.get((TypeVar) tv);
+                    if (bound == null) {
+                        return null;
+                    }
+                    typeArgs.append(typeTree(bound));
+                }
                 make.at(call.pos);
-                return make.Apply(com.sun.tools.javac.util.List.nil(),
+                return make.Apply(typeArgs.toList(),
                         make.Select(qualified((ClassSymbol) m.owner), m.name), args.toList());
             }
 
@@ -509,6 +868,11 @@ final class ImplicitResolver {
                 addCompanions(required, companions, new java.util.HashSet<>());
                 levels.add(new ArrayList<>(companions));
 
+                // instances for JDK types, which can't live next to List or Optional
+                Set<Symbol> defaults = new LinkedHashSet<>();
+                addGivens(defaultInstances, defaults);
+                levels.add(new ArrayList<>(defaults));
+
                 levels.replaceAll(level -> level.stream()
                         .filter(s -> s.owner.kind == Kind.MTH || rs.isAccessible(env, s.owner.type, s))
                         .toList());
@@ -540,7 +904,78 @@ final class ImplicitResolver {
         }
     }
 
+    /**
+     * javac caches the types of poly arguments by source position (ArgumentAttr). What the
+     * resolver attributes in half-resolved code must not end up in the cache the real
+     * attribution uses, so each such attribution runs against its own cache.
+     */
+    private Object swapArgumentCache(Object cache) {
+        try {
+            Object previous = argumentCache.get(argumentAttr);
+            argumentCache.set(argumentAttr, cache);
+            return previous;
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** A call whose value is assigned or returned (and not already narrowed). */
+    private static boolean narrowable(TreePath path) {
+        Tree call = path.getLeaf();
+        return switch (path.getParentPath().getLeaf()) {
+            case JCVariableDecl v -> v.init == call && v.vartype != null && !v.declaredUsingVar();
+            case JCReturn r -> r.expr == call;
+            case JCAssign a -> a.rhs == call;
+            default -> false;
+        };
+    }
+
+    /** A comprehension step the resolver has passed its instance to, but whose type arguments are still inferred. */
+    private boolean isUnpinnedStep(JCMethodInvocation call, Name name) {
+        return call.typeargs.isEmpty() && call.args.size() == 3
+                && call.meth instanceof JCFieldAccess select && select.selected.toString().equals("forj.For")
+                && (name.contentEquals("forjFlatMap") || name.contentEquals("forjMap") || name.contentEquals("forjFilter"));
+    }
+
     // ------------------------------------------------------------------- types
+
+    /** Parameter types of a functional interface type's method, wildcards replaced by their bounds. */
+    private List<Type> descriptorInputs(Type functional) {
+        if (!(functional.tsym instanceof ClassSymbol c) || !c.isInterface()) {
+            return null;
+        }
+        ListBuffer<Type> args = new ListBuffer<>();
+        for (Type a : functional.getTypeArguments()) {
+            args.append(a instanceof WildcardType w ? (w.type != null ? w.type : types.erasure(c.type)) : a);
+        }
+        Type plain = new Type.ClassType(functional.getEnclosingType(), args.toList(), c);
+        try {
+            Symbol descriptor = types.findDescriptorSymbol(c);
+            return types.memberType(plain, descriptor).getParameterTypes();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** A type that can be written in source as is: classes, arrays and type variables, no captures. */
+    private boolean isPlain(Type t) {
+        if (t instanceof Type.CapturedType || t.isErroneous() || t.isPrimitiveOrVoid() || t.hasTag(com.sun.tools.javac.code.TypeTag.BOT)) {
+            return false;
+        }
+        if (t instanceof ArrayType a) {
+            return isPlain(a.elemtype);
+        }
+        if (t instanceof TypeVar || t instanceof Type.ClassType) {
+            for (Type arg : t.getTypeArguments()) {
+                Type inner = arg instanceof WildcardType w ? w.type : arg;
+                if (inner != null && !isPlain(inner)) {
+                    return false;
+                }
+            }
+            return !(t instanceof Type.IntersectionClassType);
+        }
+        return false;
+    }
 
     /** Binds type variables of {@code pattern} so it matches {@code actual} (one-sided, best effort). */
     private void unify(Type pattern, Type actual, Map<TypeVar, Type> bindings, List<Type> tvars) {
@@ -582,9 +1017,9 @@ final class ImplicitResolver {
         return types.subst(t, from.toList(), to.toList());
     }
 
-    /** Still mentions one of {@code method}'s own type variables. */
-    private boolean hasUnbound(Type t, MethodSymbol method) {
-        List<Type> tvars = method.type.getTypeArguments();
+    /** Mentions one of {@code method}'s own type variables that {@code bindings} doesn't bind. */
+    private boolean hasUnbound(Type t, MethodSymbol method, Map<TypeVar, Type> bindings) {
+        List<Type> tvars = method.type.getTypeArguments().stream().filter(v -> !bindings.containsKey((TypeVar) v)).toList();
         if (tvars.isEmpty()) {
             return false;
         }
@@ -640,6 +1075,32 @@ final class ImplicitResolver {
             }
         }
         return true;
+    }
+
+    /**
+     * A type written out as source would write it, with no symbols attached, so javac
+     * attributes it like hand-written code ({@code TreeMaker.Type} pre-attributes its trees).
+     */
+    private JCExpression typeTree(Type t) {
+        if (t instanceof ArrayType a) {
+            return make.TypeArray(typeTree(a.elemtype));
+        }
+        if (t instanceof TypeVar v) {
+            return make.Ident(v.tsym.name);
+        }
+        if (t instanceof WildcardType w) {
+            var kind = make.TypeBoundKind(w.kind);
+            return make.Wildcard(kind, w.type == null || w.kind == com.sun.tools.javac.code.BoundKind.UNBOUND ? null : typeTree(w.type));
+        }
+        JCExpression base = qualified((ClassSymbol) t.tsym);
+        if (t.getTypeArguments().isEmpty()) {
+            return base;
+        }
+        ListBuffer<JCExpression> args = new ListBuffer<>();
+        for (Type arg : t.getTypeArguments()) {
+            args.append(typeTree(arg));
+        }
+        return make.TypeApply(base, args.toList());
     }
 
     private JCExpression qualified(ClassSymbol owner) {

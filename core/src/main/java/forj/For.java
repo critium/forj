@@ -1,9 +1,12 @@
 package forj;
 
-import java.util.ArrayList;
-import java.util.Collections;
+import forj.data.CallableK;
+import forj.data.ListK;
+import forj.data.OptionalK;
+import forj.typeclass.Functor;
+import forj.typeclass.FunctorFilter;
+import forj.typeclass.Monad;
 import java.util.List;
-import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.function.Function;
@@ -11,107 +14,109 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
- * Scala-style for comprehensions for Java.
+ * What forj comprehensions compile to. The plugin rewrites
  *
  * <pre>{@code
- * List<String> r = forj {
- *     n <- List.of(1, 2, 3);
- *     guard(n % 2 == 1);
- *     s <- List.of("a", "b");
- * } yield s + n;
+ * forj {                       forj.For.run(() -> forjLower(
+ *     x <- xs;                     forj.For.forjFlatMap(forjLift(xs), x ->
+ *     guard(p(x));      ==>            forj.For.forjMap(forj.For.forjFilter(forjLift(ys(x)), y -> p(x)),
+ *     y <- ys(x);                          y -> f(x, y)))))
+ * } yield f(x, y);
  * }</pre>
  *
- * The forj javac plugin ({@code -Xplugin:Forj}) rewrites every {@code forj} block into
- * nested {@code forjFlatMap}/{@code forjMap}/{@code forjFilter} calls before type checking,
- * and adds {@code import static forj.For.*;} to files that use it.
+ * (guards filter the generator they follow) and passes each combinator its type class
+ * instance at compile time: a comprehension over {@code F} needs a {@code Monad<F>}
+ * ({@code Functor<F>} for a single generator, plus {@code FunctorFilter<F>} for guards).
+ * Generic code ({@code <F> ... using Monad<F> m}) works the same way as concrete types.
  *
- * <h2>Monad instances</h2>
- * A type {@code M<A>} participates in comprehensions when some statically imported
- * class provides these static overloads for it:
- * <pre>{@code
- * static <A, B> M<B> forjFlatMap(M<A> m, Function<? super A, ? extends M<B>> f)
- * static <A, B> M<B> forjMap(M<A> m, Function<? super A, ? extends B> f)
- * static <A>    M<A> forjFilter(M<A> m, Predicate<? super A> p)                // only needed for guard
- * }</pre>
- * The rewritten code calls these unqualified, so javac's overload resolution across
- * all {@code import static ...*} declarations picks the instance for the type at hand.
- * Third-party types plug in by shipping such a class; no plugin changes are needed.
- * This class holds the JDK instances.
+ * <h2>Lifting</h2>
+ * {@code forjLift} turns a generator's value into a {@code Kind} and is called unqualified,
+ * so overloads from any {@code import static} take part. {@code forjLower} turns the result
+ * back, through the {@link Lower} method for the witness. A library adds a type by shipping a
+ * {@code forjLift} overload, a {@code @Lower} method and a {@code given Monad<ItsType>}.
+ * Types that already are a {@code Kind} (like {@code IO}) need none of the first two.
+ * This class is imported automatically into files that use forj.
  */
+@SuppressWarnings({"rawtypes", "unchecked"})
 public final class For {
     private For() {}
 
-    /** What the plugin turns {@code forj { ... } yield e} into: runs the desugared body. */
+    /** Runs the desugared body; target of the rewritten {@code forj}. */
     public static <R> R run(Supplier<R> body) {
         return body.get();
     }
 
-    // -------------------------------------------------------------- Optional
+    // ------------------------------------------------------------- combinators
 
-    public static <A, B> Optional<B> forjFlatMap(Optional<A> m, Function<? super A, ? extends Optional<B>> f) {
-        return m.flatMap(f);
+    public static <F, A, B> Kind<F, B> forjFlatMap(Kind<F, A> fa, Function<? super A, ? extends Kind<F, B>> f,
+                                                   @Using Monad<F> monad) {
+        return monad.flatMap(fa, f);
     }
 
-    public static <A, B> Optional<B> forjMap(Optional<A> m, Function<? super A, ? extends B> f) {
-        return m.map(f);
+    public static <F, A, B> Kind<F, B> forjMap(Kind<F, A> fa, Function<? super A, ? extends B> f,
+                                               @Using Functor<F> functor) {
+        return functor.map(fa, f);
     }
 
-    public static <A> Optional<A> forjFilter(Optional<A> m, Predicate<? super A> p) {
-        return m.filter(p);
+    public static <F, A> Kind<F, A> forjFilter(Kind<F, A> fa, Predicate<? super A> p,
+                                               @Using FunctorFilter<F> filter) {
+        return filter.filter(fa, p);
     }
 
-    // ------------------------------------------------------------------ List
+    // ------------------------------------------------------------------ lifting
 
-    public static <A, B> List<B> forjFlatMap(List<A> m, Function<? super A, ? extends List<B>> f) {
-        List<B> out = new ArrayList<>();
-        for (A a : m) {
-            out.addAll(f.apply(a));
-        }
-        return Collections.unmodifiableList(out);
+    public static <F, A> Kind<F, A> forjLift(Kind<F, A> fa) {
+        return fa;
     }
 
-    public static <A, B> List<B> forjMap(List<A> m, Function<? super A, ? extends B> f) {
-        List<B> out = new ArrayList<>(m.size());
-        for (A a : m) {
-            out.add(f.apply(a));
-        }
-        return Collections.unmodifiableList(out);
+    /** {@code forjLift} for values that are already a {@code Kind}; the plugin picks it when overloads would be ambiguous. */
+    public static <F, A> Kind<F, A> forjKind(Kind<F, A> fa) {
+        return fa;
     }
 
-    public static <A> List<A> forjFilter(List<A> m, Predicate<? super A> p) {
-        List<A> out = new ArrayList<>();
-        for (A a : m) {
-            if (p.test(a)) {
-                out.add(a);
-            }
-        }
-        return Collections.unmodifiableList(out);
+    public static <A> Kind<List, A> forjLift(List<A> list) {
+        return new ListK<>(list);
     }
 
-    // ---------------------------------------------------------------- Callable
+    public static <A> Kind<Optional, A> forjLift(Optional<A> optional) {
+        return new OptionalK<>(optional);
+    }
 
-    /*
-     * A Callable is a lazy computation: a comprehension over Callables builds a bigger
-     * Callable and runs nothing until call(). Steps run one after another on the calling
-     * thread; blocking inside them is cheap on a virtual thread.
+    public static <A> Kind<Callable, A> forjLift(Callable<A> callable) {
+        return new CallableK<>(callable);
+    }
+
+    /**
+     * Turns a comprehension's result back into a plain type. Written for types that are their
+     * own {@code Kind} (like {@code IO}) and for generic {@code F}: the target type must be a
+     * {@code Kind<F, A>}, so a wrong yield type is a compile error. For witnesses with an
+     * {@link Lower} method the plugin calls that instead, e.g. {@link #lowerList}.
      */
-
-    public static <A, B> Callable<B> forjFlatMap(Callable<A> m, Function<? super A, ? extends Callable<B>> f) {
-        return () -> f.apply(m.call()).call();
+    public static <F, A, K extends Kind<F, A>> K forjLower(Kind<F, A> fa) {
+        return (K) fa;
     }
 
-    public static <A, B> Callable<B> forjMap(Callable<A> m, Function<? super A, ? extends B> f) {
-        return () -> f.apply(m.call());
+    /**
+     * What the plugin wraps a call returning {@code Kind<F, A>} in when it is assigned or
+     * returned: {@code IO<Unit> app = checkout(cart);} works without {@code IO.narrow}. Checked:
+     * the target must be a {@code Kind<F, A>}.
+     */
+    public static <F, A, K extends Kind<F, A>> K forjNarrow(Kind<F, A> fa) {
+        return (K) fa;
     }
 
-    /** A failed guard makes call() throw {@link NoSuchElementException}. */
-    public static <A> Callable<A> forjFilter(Callable<A> m, Predicate<? super A> p) {
-        return () -> {
-            A a = m.call();
-            if (!p.test(a)) {
-                throw new NoSuchElementException("forj guard failed for " + a);
-            }
-            return a;
-        };
+    @Lower
+    public static <A> List<A> lowerList(Kind<List, A> fa) {
+        return ListK.narrow(fa);
+    }
+
+    @Lower
+    public static <A> Optional<A> lowerOptional(Kind<Optional, A> fa) {
+        return OptionalK.narrow(fa);
+    }
+
+    @Lower
+    public static <A> Callable<A> lowerCallable(Kind<Callable, A> fa) {
+        return CallableK.narrow(fa);
     }
 }

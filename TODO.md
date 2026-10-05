@@ -122,7 +122,10 @@ and `x <- e;` show up as syntax errors, and completion and hover don't work insi
 - Ambiguous givens are an error even where Scala would pick the more specific one.
 - Each call site re-attributes its enclosing method up to the call (`Trees.getScope`), which
   is quadratic in method size. Cache scopes per method if it shows up in build times.
-- Return-type inference for `using` methods: see "Toward real type classes" below.
+- Return-type inference for `using` methods works from a typed local, a `return` or an
+  assignment, but not from an argument position: `describe(checkout(order))` can't infer
+  `checkout`'s `F` from `describe`'s parameter (which itself comes from `describe`'s target).
+  Needs inference across nested calls.
 
 ## Toward real type classes
 
@@ -130,27 +133,25 @@ What `examples/.../typeclasses/` has today is type classes over plain types (`Sh
 chosen by type at compile time, generic constraints (`using Show<A>`), derived and
 retroactive instances. These are the gaps, most valuable first.
 
-1. **Return-type polymorphism.** Infer type parameters from the expected type, not only from
-   arguments, so `Integer zero = Monoid.empty();` finds `Monoid<Integer>` without writing
-   `Monoid.<Integer>empty()`. Needs the call's target type (assignment, return, argument
-   position) during resolution. Then add a `Monoid` example (`empty`, `combine`,
-   `combineAll`): it shows what type classes do that interfaces can't.
-2. **Higher-kinded type classes.** Java has no `F<_>`, so `Functor<F>`, `Monad<F>` and
-   `Traverse<F>` can't be written, and forj's monads are static-import overloads rather than
-   a type class (no generic code over "any monad"). Use the encoding from Arrow-Java and
-   HighJ: a witness type per container (`ListKind.Witness`), `Kind<F, A>` with
-   `narrow`/`widen`, then `given Monad<ListKind.Witness>` instances. Then decide:
-   - whether forj comprehensions should desugar to `Monad<F>` calls instead of overloads;
-   - whether the plugin can hide the `Kind` wrapping and unwrapping at call sites.
-3. **Extension syntax.** `money.show()` instead of `Show.show(money)`, like Scala 3
-   `extension` methods: would need the plugin to rewrite unresolved method calls on a
-   receiver to type class calls.
+1. **Return-type polymorphism.** Done for a typed local, a `return` and an assignment
+   (`IO<Receipt> p = checkout(order);` infers `F = IO`). Still missing: from an argument
+   position, and a `Monoid` example (`empty`, `combine`, `combineAll`).
+2. **Higher-kinded type classes.** Done: `Kind<F, A>` with raw classes as witnesses, the CE2
+   ladder in `forj.typeclass`, `IO`, `F<_>` syntax, comprehensions through `Monad<F>`.
+   Follow-ups:
+   - `Resource`, `Timer`/`Clock`, `Effect`/`ConcurrentEffect`, `LiftIO`;
+   - law tests for the instances (functor/monad laws, `MonadError` and `Bracket` laws);
+   - automatic lifting and lowering of JDK types at call sites of `F<_>` methods
+     (`addBoth(List.of(1), List.of(2))` instead of `new ListK<>(...)`, and a `List` back);
+   - a "most specific instance wins" rule if a type ever gets two instances on one ladder.
+3. **Extension syntax.** `money.show()` instead of `Show.show(money)`, and `fa.map(f)` on any
+   `F<A>` with a `Functor<F>` in scope, like Scala 3 `extension` methods: would need the
+   plugin to rewrite unresolved method calls on a receiver to type class calls.
 4. **Coherence (decide, don't necessarily build).** Like Scala, forj allows more than one
    instance per type (local givens), so a value can be shown differently at different call
    sites. Haskell forbids that. Decide whether to offer a strict mode.
-5. **A better example.** `Show` is little more than `Function<A, String>`. Replace or extend
-   the package with `Monoid` (after 1) and `Functor`/`Monad` (after 2); until then, consider
-   renaming the package to `givens` so it doesn't promise more than it shows.
+5. **A better type class example.** `Show` is little more than `Function<A, String>`; add
+   `Monoid` (after 1). `Functor`/`Monad` now exist (`hkt/`, `tagless/`).
 
 ## More Scala syntax
 

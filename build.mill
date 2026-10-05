@@ -42,7 +42,7 @@ val javacInternals = Seq("api", "code", "comp", "main", "parser", "tree", "util"
   .map(p => s"--add-exports=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
 
 /** JVM flags for any JVM that runs javac with the plugin: it also swaps javac's parser factory. */
-val pluginJvmOptions = javacInternals ++ Seq("main", "util")
+val pluginJvmOptions = javacInternals ++ Seq("comp", "main", "util")
   .map(p => s"--add-opens=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
 
 /** Runtime API: the JDK monad instances and Par. No dependencies. */

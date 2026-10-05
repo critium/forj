@@ -18,8 +18,9 @@ findUser(name).flatMap(user ->
         findAddress(manager).map(address -> address.city())));
 ```
 
-It works with `Optional`, `List` and `Callable` out of the box, and any other type can plug
-in by providing three static methods (`forjFlatMap`, `forjMap`, and optionally `forjFilter`).
+Comprehensions run on real type classes: a block over `F` needs a `Monad<F>`, found at
+compile time like any other `given`. Instances for `Optional`, `List`, `Callable` and forj's
+own `IO` are built in, and the same block works for any `F`, including a type parameter.
 `forj.Par` adds parallel calls on structured concurrency, in the style of cats-effect's
 `parMapN`.
 
@@ -48,6 +49,39 @@ raw"C:\temp\$file"                         // backslashes stay backslashes
 - New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
 - Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
 
+## Higher-kinded types, the CE2 ladder and tagless final
+
+Write `F<_>` for a type parameter that takes a type, and program against capabilities the way
+cats-effect 2 does:
+
+```java
+public interface Inventory<F<_>> {                       // an algebra, in any effect F
+    F<Integer> stock(String item);
+    F<Unit> reserve(String item, int quantity);
+}
+
+public static <F<_>> F<Receipt> checkout(Order order) using Sync<F> sync, Inventory<F> inventory, Payments<F> payments {
+    return forj {
+        available <- inventory.stock(order.item());
+        _ <- available >= order.quantity() ? sync.unit() : sync.<Unit>raiseError(new OutOfStock(...));
+        _ <- inventory.reserve(order.item(), order.quantity());
+        transaction <- payments.charge(order.customer(), order.totalCents());
+    } yield new Receipt(order, transaction);
+}
+
+given Inventory<IO> inventory = new Live.Warehouse(stock);
+given Payments<IO> payments = new Live.Bank();
+IO<Receipt> program = checkout(order);                  // F = IO, from the target type
+Receipt receipt = program.unsafeRunSync();              // nothing ran until here
+```
+
+The ladder is `Functor` → `Applicative` → `Monad` → `MonadError` → `Bracket` → `Sync` →
+`Async` → `Concurrent`. `IO` is lazy and stack safe, and runs on virtual threads, with fibers,
+`race` and `parMap2` on structured concurrency. A function asks for the least it needs, and
+asking for more than an effect has is a compile error:
+`forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>`.
+The runnable version is in `examples/.../tagless/`.
+
 ## Syntax at a glance
 
 ```java
@@ -71,7 +105,9 @@ List<String> labels = forj {
    code you wrote.
 2. **After parsing, before type checking**, it desugars each block the way scalac does:
    every generator but the last becomes `forjFlatMap`, the last becomes `forjMap`, and
-   guards become `forjFilter`. javac then type checks the result as ordinary Java.
+   guards become `forjFilter`: methods that take the `Monad<F>` (or `Functor<F>`,
+   `FunctorFilter<F>`) instance as a `using` parameter. javac then type checks the result as
+   ordinary Java.
 3. **Just before javac type checks each class**, it fills in `using` arguments that calls
    leave out. It type checks copies of the call's arguments to infer the method's type
    parameters, searches for a `given` of each required type (recursively, for givens that
@@ -124,9 +160,9 @@ Set `def forjDebug = true` to print each desugared comprehension during compilat
 
 | Path | What it is |
 |---|---|
-| `core/` | `forj.For`: monad instances for `Optional`, `List`, `Callable`. `forj.Par`: parallel combinators. `@Given`, `@Using` and `Implicits.summon`. No dependencies. |
+| `core/` | `forj.Kind` and the type class ladder (`forj.typeclass`), the `IO` effect (`forj.effect`), instances for JDK types (`forj.Instances`), what comprehensions compile to (`forj.For`), `forj.Par`, `@Given`/`@Using`/`@Lower`. No dependencies. |
 | `plugin/` | The javac plugin: `SourceRewriter` and `Interpolations` (text stage), `Desugarer` (forj blocks), `ImplicitResolver` (`given`/`using`), and the glue that installs them into javac. |
-| `examples/` | Example code and tests: a third-party monad instance (`StreamMonad`), a small HTTP server (`http/DashboardServer`), and type classes with `given`/`using` (`typeclasses/`). |
+| `examples/` | Example code and tests: a third-party monad (`StreamMonad`), a small HTTP server (`http/`), type classes with `given`/`using` (`typeclasses/`), one comprehension for any monad (`hkt/`), and tagless final with two interpreters (`tagless/`). |
 | `bin/fetch-jdk` | Downloads and verifies the pinned JDK, then runs `bin/make-preview-jdk`. |
 | `TODO.md` | Known issues and planned work. |
 
@@ -143,3 +179,7 @@ This is an experiment. It works and is tested, but:
 - **Tied to javac internals.** The plugin swaps javac's parser factory and edits its trees,
   so it targets one JDK at a time (currently JDK 28 early access).
 - **Preview features.** Code using forj is compiled and run with `--enable-preview`.
+- **Wrapping cost for JDK types.** Comprehensions always go through the `Monad<F>` type
+  class, so `List`, `Optional` and `Callable` values are wrapped: about 3-4 ns per step,
+  invisible next to real work (+3% for a 100×100 `List`), noticeable only in hot loops of
+  tiny `Optional` chains. `IO` implements `Kind` itself and pays nothing.

@@ -14,6 +14,7 @@ import com.sun.tools.javac.tree.JCTree.JCImport;
 import com.sun.tools.javac.tree.JCTree.JCLambda;
 import com.sun.tools.javac.tree.JCTree.JCMethodInvocation;
 import com.sun.tools.javac.tree.JCTree.JCPackageDecl;
+import com.sun.tools.javac.tree.JCTree.JCReturn;
 import com.sun.tools.javac.tree.JCTree.JCStatement;
 import com.sun.tools.javac.tree.JCTree.JCSwitchExpression;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
@@ -37,19 +38,21 @@ import javax.tools.Diagnostic;
  * Rewrites, purely syntactically (the same way scalac does):
  *
  * <pre>{@code
- * forj {                           forj.For.run(() -> {
- *     x <- xs;                         return forjFlatMap(forjFilter(xs, x -> p(x)), x -> {
+ * forj {                           forjLower(
+ *     x <- xs;                         forj.For.forjFlatMap(forj.For.forjFilter(forjLift(xs), x -> p(x)), x -> {
  *     guard(p(x));                         var z = f(x);
- *     var z = f(x);          ==>           return forjMap(ys(z), y -> {
+ *     var z = f(x);          ==>           return forj.For.forjMap(forjLift(ys(z)), y -> {
  *     y <- ys(z);                              return g(x, y);
  * } yield g(x, y);                         });
- *                                      });
- *                                  });
+ *                                      }))
  * }</pre>
  *
- * Statements before a generator stay where they are; every generator but the last becomes
- * {@code forjFlatMap}, the last becomes {@code forjMap}, and the statements after it (ending
- * in {@code yield}) become the map body. Guards filter the generator directly above them.
+ * Statements before a generator stay where they are (then the whole block is wrapped in
+ * {@code forj.For.run(() -> {...})}); every generator but the last becomes
+ * {@code forjFlatMap}, the last {@code forjMap}, and the statements after it (ending in the
+ * {@code yield}) its body. Guards filter the generator they follow. The type class instances
+ * these take ({@code Monad<F>}, ...) are passed later by {@link ImplicitResolver}, once javac
+ * knows {@code F}.
  *
  * <p>It sees the output of {@link SourceRewriter}: {@code forj (() -> { ... yield e; })},
  * with generators as {@code x = e} assignments. The rewrite result says which assignments
@@ -66,7 +69,7 @@ final class Desugarer extends TreeTranslator {
     private final Set<Integer> missingYield;
     private final boolean debug;
 
-    private final Name forjPkg, forClass, run, forjBlock, guard, flatMap, map, filter;
+    private final Name forjPkg, forClass, run, forjBlock, guard, flatMap, map, filter, lift, lower;
 
     private boolean rewrote;
     private int fresh;
@@ -88,6 +91,8 @@ final class Desugarer extends TreeTranslator {
         this.flatMap = names.fromString("forjFlatMap");
         this.map = names.fromString("forjMap");
         this.filter = names.fromString("forjFilter");
+        this.lift = names.fromString("forjLift");
+        this.lower = names.fromString("forjLower");
     }
 
     void run() {
@@ -101,42 +106,51 @@ final class Desugarer extends TreeTranslator {
     @Override
     public void visitApply(JCMethodInvocation tree) {
         super.visitApply(tree); // inner comprehensions first
-        if (isCall(tree, forjBlock)) {
-            rewriteForj(tree);
-        }
-        result = tree;
+        result = isCall(tree, forjBlock) ? rewriteForj(tree) : tree;
     }
 
     // ------------------------------------------------------------- rewriting
 
-    private void rewriteForj(JCMethodInvocation call) {
+    /** The desugared comprehension: the expression itself, or {@code forj.For.run(() -> {...})} if it needs statements. */
+    private JCExpression rewriteForj(JCMethodInvocation call) {
         if (call.args.size() != 1
                 || !(call.args.head instanceof JCLambda lambda)
                 || !lambda.params.isEmpty()
                 || !(lambda.body instanceof JCBlock body)) {
             error(call, "write comprehensions as forj { ... } yield expr");
-            return;
+            return call;
         }
         if (missingYield.contains(call.meth.pos)) {
             error(call.meth, "forj { ... } must be followed by yield <expr>");
             forgetArrows(body); // already reported; don't also flag them as misplaced
-            return;
+            return call;
         }
         if (indexOfGenerator(body.stats) < 0) {
             error(call.meth, "comprehension has no generator (x <- ...)");
-            return;
+            return call;
         }
         body.stats = desugar(body.stats);
+        lowerResult(body, call.meth.pos);
         rejectStrayMarkers(body);
-
-        make.at(call.meth.pos);
-        call.meth = make.Select(make.Select(make.Ident(forjPkg), forClass), run);
         rewrote = true;
+
+        JCExpression result;
+        if (body.stats.size() == 1 && body.stats.head instanceof JCReturn ret) {
+            // Nothing before the first generator: the comprehension is one expression. Leaving
+            // out the run(() -> {...}) wrapper spares javac a layer of lambda inference, which
+            // nested comprehensions capturing outer bindings otherwise trip over.
+            result = ret.expr;
+        } else {
+            make.at(call.meth.pos);
+            call.meth = make.Select(make.Select(make.Ident(forjPkg), forClass), run);
+            result = call;
+        }
 
         if (debug) {
             long line = unit.getLineMap().getLineNumber(call.pos);
-            System.err.println("[forj] " + unit.getSourceFile().getName() + ":" + line + "\n" + call);
+            System.err.println("[forj] " + unit.getSourceFile().getName() + ":" + line + "\n" + result);
         }
+        return result;
     }
 
     private List<JCStatement> desugar(List<JCStatement> stats) {
@@ -157,12 +171,19 @@ final class Desugarer extends TreeTranslator {
         boolean anonymous = arrows.remove(arrow.pos);
         JCIdent binder = (JCIdent) arrow.lhs;
         Name var = anonymous ? names.fromString("forj$" + fresh++) : binder.name;
-        JCExpression source = arrow.rhs;
+        // Generated nodes that javac may treat as poly arguments get positions no other such
+        // node has: javac caches argument types by source position (ArgumentAttr), and two
+        // arguments at one position get each other's types. Each sits on a different
+        // character of the generator: forjLift on `<`, the continuation on `-`, the call on `x`.
+        make.at(arrow.pos);
+        JCExpression source = make.Apply(List.nil(), make.Ident(lift), List.of(arrow.rhs));
 
-        make.at(generator.pos);
         while (rest.nonEmpty() && isGuard(rest.head)) {
-            JCExpression cond = ((JCMethodInvocation) ((JCExpressionStatement) rest.head).expr).args.head;
-            source = call(filter, source, make.Lambda(List.of(param(var, binder, anonymous)), cond));
+            JCMethodInvocation guardCall = (JCMethodInvocation) ((JCExpressionStatement) rest.head).expr;
+            make.at(guardCall.meth.pos);
+            JCLambda test = make.Lambda(List.of(param(var, binder, anonymous)), guardCall.args.head);
+            make.at(guardCall.pos);
+            source = call(filter, source, test);
             rest = rest.tail;
         }
 
@@ -173,9 +194,12 @@ final class Desugarer extends TreeTranslator {
 
         boolean last = indexOfGenerator(rest) < 0;
         List<JCStatement> inner = last ? yieldsToReturns(rest) : desugar(rest);
-        make.at(generator.pos);
+        make.at(arrow.pos + 1);
         JCLambda continuation = make.Lambda(List.of(param(var, binder, anonymous)), make.Block(0, inner));
-        prefix.append(make.Return(call(last ? map : flatMap, source, continuation)));
+        make.at(binder.pos);
+        JCExpression step = call(last ? map : flatMap, source, continuation);
+        make.at(generator.pos);
+        prefix.append(make.Return(step));
         return prefix.toList();
     }
 
@@ -188,10 +212,22 @@ final class Desugarer extends TreeTranslator {
         return out.toList();
     }
 
+    /**
+     * {@code forj.For.forjFlatMap(fa, f)}: the type class instance is a {@code using}
+     * parameter, passed by the implicit resolver once javac knows {@code fa}'s type.
+     */
     private JCMethodInvocation call(Name method, JCExpression monad, JCLambda fn) {
-        // Unqualified on purpose: overload resolution across every `import static X.*`
-        // in the file selects the monad instance, which is how third parties plug in.
-        return make.Apply(List.nil(), make.Ident(method), List.of(monad, fn));
+        return make.Apply(List.nil(), make.Select(make.Select(make.Ident(forjPkg), forClass), method),
+                List.of(monad, fn));
+    }
+
+    /** The comprehension's value goes back from {@code Kind<F, A>} to the type it stands for. */
+    private void lowerResult(JCBlock body, int forjKeyword) {
+        if (body.stats.last() instanceof JCReturn ret && ret.expr != null) {
+            make.at(forjKeyword);
+            // unqualified: forjLift/forjLower overloads come from For and any static import
+            ret.expr = make.Apply(List.nil(), make.Ident(lower), List.of(ret.expr));
+        }
     }
 
     /**

@@ -41,45 +41,68 @@ forj {
 Purely syntactic, before type checking, like scalac:
 
 ```java
-forj {                      forj.For.run(() ->
-    x <- xs;                    forjFlatMap(forjFilter(xs, x -> p(x)), x -> {
+forj {                      forjLower(
+    x <- xs;                    forjFlatMap(forjFilter(forjLift(xs), x -> p(x)), x -> {
     guard(p(x));                    var z = f(x);
-    var z = f(x);       ==>         return forjMap(ys(z), y -> g(x, y));
-    y <- ys(z);                 }));
+    var z = f(x);       ==>         return forjMap(forjLift(ys(z)), y -> g(x, y));
+    y <- ys(z);                 }))
 } yield g(x, y);
 ```
 
-- `flatMap`, `map` and `withFilter` become `forjFlatMap`, `forjMap` and `forjFilter`.
+- `flatMap`, `map` and `withFilter` become `forjFlatMap`, `forjMap` and `forjFilter`, which
+  take the `Monad<F>`, `Functor<F>` and `FunctorFilter<F>` instance as `using` parameters.
   There is no separate `withFilter`; the filter is strict.
 - A value definition doesn't need tupling as in Scala: it is just a local variable inside
   the next lambda.
 - A guard after a value definition is rejected rather than tupled (see the table above).
 
-## Type classes, Java style
+## Type classes and higher kinds
 
-Scala resolves `flatMap` as a method on the value. Java's `Optional`, `List` and `Callable`
-don't share an interface, so forj resolves instances through **overloading on static
-imports**. An instance for `M[_]` is a class with static methods:
+Unlike scalac, which calls `flatMap` on the value, forj always goes through a real
+`Monad<F>` type class (cats-style), resolved at compile time like any `given`. That is what
+lets one comprehension work for any `F`:
 
 ```java
-static <A, B> M<B> forjFlatMap(M<A> m, Function<? super A, ? extends M<B>> f)
-static <A, B> M<B> forjMap(M<A> m, Function<? super A, ? extends B> f)
-static <A>    M<A> forjFilter(M<A> m, Predicate<? super A> p)    // optional, for guard
+static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b) using Monad<F> m {
+    return forj { x <- a; y <- b; } yield x + y;
+}
 ```
 
-The generated calls are unqualified, so javac's overload resolution across every
-`import static X.*` picks the instance. Think of the static import as bringing an implicit
-instance into scope. Resolution is by the static type of the generator expression,
-at compile time, with no runtime cost. JDK instances live in `forj.For` and are imported
-automatically; `examples/.../StreamMonad.java` shows a third-party one.
+`F<_>` declares a higher-kinded parameter (Scala's `F[_]`). `F<A>` compiles to
+`forj.Kind<F, A>`, the "lightweight higher-kinded types" encoding used by HighJ and
+Arrow-Java, with the raw class as the witness: `Kind<List, A>`, `Monad<IO>`. Types forj owns
+implement `Kind` directly (`IO<A> implements Kind<IO, A>`); JDK types are wrapped
+(`ListK`, `OptionalK`, `CallableK`), which costs an allocation per step.
 
-As in Scala, every generator in a block must have the same container type: a `List`
-generator followed by an `Optional` one doesn't compile.
+As in Scala, every generator in a block must have the same `F`: a `List` generator followed
+by an `Optional` one doesn't compile.
 
-## Effects: `Callable` is `IO`, not `Future`
+## cats-effect 2, in Java
+
+| cats-effect 2 | forj |
+|---|---|
+| `F[_]`, `F[A]` | `F<_>`, `F<A>` |
+| `Functor`, `Applicative`, `Monad` | same names in `forj.typeclass` |
+| `ApplicativeError[F, E]`, `MonadError[F, E]` | same |
+| `Bracket[F, E]`, `Sync[F]`, `Async[F]`, `Concurrent[F]` | same (`Sync` is `Bracket<F, Throwable>`) |
+| `Fiber[F, A]` with `join` / `cancel` | same |
+| `Traverse`, `FunctorFilter` | same |
+| `IO`, `IO.delay`, `IO.suspend`, `IO.async`, `unsafeRunSync()` | `forj.effect.IO`, same |
+| `IO.race`, `parMapN` | `IO.race`, `IO.parMap2`, `Par.mapN` for `Callable` |
+| `implicit` instances, `F: Sync` context bounds | `given`, `using Sync<F> sync` |
+| tagless final algebras `trait Repo[F[_]]` | `interface Repo<F<_>>` |
+
+Differences: no `Resource`, `Timer`, `ContextShift`, `Effect`/`ConcurrentEffect` or
+`LiftIO`; no syntax extensions (`fa.map(f)` on any `F`; you call the instance:
+`functor.map(fa, f)`); cancellation is thread interruption, checked between `IO` steps and
+at blocking calls, rather than CE's cancellation tokens; `IO` blocks a virtual thread instead
+of running on a fiber scheduler, so there is no `tailRecM` (the interpreter is stack safe on
+its own).
+
+## Effects: `Callable` and `IO`, not `Future`
 
 `CompletableFuture` behaves like Scala's `Future`: it starts running when it's created.
-forj supports `Callable` instead, which behaves like cats-effect `IO`:
+forj supports `Callable` (lazy, `Sync`) and its own `IO` (lazy, `Concurrent`) instead:
 
 ```java
 Callable<String> dashboard = forj {
