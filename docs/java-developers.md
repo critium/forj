@@ -159,6 +159,41 @@ No plugin changes are needed: the generated code calls `forjFlatMap(...)` unqual
 and javac's normal overload resolution picks the right one from your static imports.
 The JDK types (`Optional`, `List`, `Callable`) are imported automatically.
 
+## String interpolation
+
+Put values straight into a string, instead of `+` chains or `String.format`:
+
+```java
+String name = "ana";
+int total = 1250;
+
+s"Hi $name, you owe ${total / 100} dollars"   // "Hi ana, you owe 12 dollars"
+f"$name%-6s|${total / 100.0}%8.2f"             // "ana   |   12.50"
+raw"C:\temp\$name.txt"                        // C:\temp\ana.txt  (backslashes kept)
+```
+
+| Form | Does |
+|---|---|
+| `$name` | inserts a variable (letters, digits, `_`; a following `.x` stays text) |
+| `${expression}` | inserts any expression, including method calls and nested quotes |
+| `$$` | a literal `$` |
+| `s"..."` | joins the parts like `+` does; escapes like `\t` work as usual |
+| `f"..."` | `String.format`: put a format right after a value (`$price%.2f`); no format means `%s`; write `%%` for a literal `%` |
+| `raw"..."` | like `s`, but `\` is an ordinary character, handy for paths and regexes |
+
+Each interpolated string is a single expression: `s"ab$x".length()` works, and
+`s"${1}${2}"` is `"12"`, not `3`. Mistakes are compile errors:
+
+```
+forj: $ must be followed by a name, {expression} or $
+forj: write $$ for a literal $, not \$
+```
+
+and errors inside `${...}` point at the exact place in the expression.
+
+Not supported yet: triple-quoted (`s"""..."""`) multi-line strings, and checking `f` formats
+against the value types at compile time (Scala does; here a mismatch fails when it runs).
+
 ## Type classes with `given` and `using`
 
 A *type class* is an interface describing something a type can do, like `Comparator`, but

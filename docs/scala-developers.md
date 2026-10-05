@@ -131,6 +131,25 @@ siblings and rethrows the failed task's exception. There is no tuple type, so th
 function usually builds a record. `StructuredTaskScope` is a preview API in JDK 27 and 28,
 so forj builds with `--enable-preview`.
 
+## String interpolation
+
+The three standard interpolators, with Scala's rules:
+
+| Scala | forj | Becomes |
+|---|---|---|
+| `s"Hi $name ${a + b}"` | same | `("Hi " + (name) + " " + (a + b) + "")` |
+| `f"$x%.2f $y"` | same | `java.lang.String.format("%.2f %s", (x), (y))` |
+| `raw"a\n$b"` | same | backslashes doubled in the literal parts |
+| `$$` | same | a literal `$` |
+
+Only the text around each expression is rewritten; the expressions stay where they were, so
+errors inside `${...}` point at the right column. Differences from Scala:
+
+- No triple-quoted `s"""..."""` yet.
+- `f` formats are not checked against the argument types at compile time; a mismatch is
+  a runtime `IllegalFormatException`.
+- No custom interpolators (`StringContext` extensions).
+
 ## `given` / `using`
 
 Scala 3 syntax, resolved at compile time like scalac does:

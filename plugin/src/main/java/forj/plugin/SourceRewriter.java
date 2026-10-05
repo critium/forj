@@ -25,6 +25,8 @@ import java.util.Set;
  * } yield f(x, y);            yield f(x, y); });
  * }</pre>
  *
+ * It also expands Scala string interpolation ({@link Interpolations}).
+ *
  * No newlines are added or removed, so line numbers are unchanged. Positions in the result
  * index the rewritten text; {@link PositionMap} converts them back to the original file,
  * which is what the plugin does to the whole tree right after parsing.
@@ -98,11 +100,25 @@ final class SourceRewriter {
 
     static Result rewrite(CharSequence input, ScannerFactory scanners, Log log) {
         String text = input.toString();
-        if (!text.contains("<-") && !text.contains(FORJ) && !text.contains(GIVEN) && !text.contains(USING)) {
+        boolean interpolates = Interpolations.mayContain(text);
+        if (!interpolates && !text.contains("<-") && !text.contains(FORJ) && !text.contains(GIVEN)
+                && !text.contains(USING)) {
             return null;
         }
         List<Token> tokens = tokenize(text, scanners, log);
         List<Edit> edits = new ArrayList<>();
+        if (interpolates) {
+            var literals = Interpolations.find(text, tokens, log);
+            if (!literals.isEmpty()) {
+                for (var literal : literals) {
+                    for (var e : literal.edits()) {
+                        edits.add(new Edit(e.start(), e.end(), e.text(), 0, Kind.TEXT));
+                    }
+                }
+                // the other rules see each interpolated string as one plain identifier
+                tokens = tokenize(Interpolations.mask(text, literals), scanners, log);
+            }
+        }
         findForjBlocks(tokens, edits);
         findArrows(tokens, edits);
         findGivens(tokens, edits);

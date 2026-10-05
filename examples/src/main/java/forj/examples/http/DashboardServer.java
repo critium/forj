@@ -63,7 +63,7 @@ public final class DashboardServer implements AutoCloseable {
         server.createContext("/orders/", ex -> app.downstream(ex, user -> "[\"book\",\"lamp\"]"));
         server.createContext("/recommendations/", ex -> app.downstream(ex, user -> "[\"desk\"]"));
         server.createContext("/shipping/", ex -> app.downstream(ex, items ->
-                "{\"items\":" + items + ",\"cents\":" + Integer.parseInt(items) * 499 + "}"));
+                s"{\"items\":$items,\"cents\":${Integer.parseInt(items) * 499}}"));
         server.start();
         return app;
     }
@@ -84,7 +84,7 @@ public final class DashboardServer implements AutoCloseable {
         try {
             respond(exchange, 200, dashboard(lastSegment(exchange)).call());   // `request` passed for us
         } catch (Exception e) {
-            respond(exchange, 502, "{\"error\":\"" + e.getMessage() + "\"}");
+            respond(exchange, 502, s"{\"error\":\"${e.getMessage()}\"}");
         }
     }
 
@@ -99,10 +99,8 @@ public final class DashboardServer implements AutoCloseable {
                     get("/recommendations/" + user),
                     Parts::new);
             shipping <- get("/shipping/" + itemCount(parts.orders()));   // needs the orders first
-        } yield "{\"profile\":" + parts.profile()
-                + ",\"orders\":" + parts.orders()
-                + ",\"recommendations\":" + parts.recommendations()
-                + ",\"shipping\":" + shipping + "}";
+        } yield s"{\"profile\":${parts.profile()},\"orders\":${parts.orders()}"
+                + s",\"recommendations\":${parts.recommendations()},\"shipping\":$shipping}";
     }
 
     /** Items in a JSON array of strings, e.g. {@code ["book","lamp"]} has 2. */

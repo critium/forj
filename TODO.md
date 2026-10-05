@@ -164,12 +164,14 @@ desugarer. Grouped by effort.
 - **Value definitions without `var`:** `y = x * 2;` inside `forj { }` becomes
   `var y = x * 2;`. Unambiguous there: assigning an outer local inside the generated
   lambdas is illegal anyway.
-- **String interpolation:** `s"Hi $name, you owe ${total / 100}"` becomes
-  `"Hi " + name + ", you owe " + (total / 100)`. javac's tokenizer sees `s"..."` as an
-  identifier followed by a string literal, so it's easy to find. Java's own string templates
-  were withdrawn after JDK 22, so this fills a real gap.
 
 ### Easy to medium (half a day)
+
+- **String interpolation follow-ups** (`s`, `f` and `raw` are done):
+  - triple-quoted `s"""..."""` multi-line strings (mapping to Java text blocks, whose
+    indentation rules differ from Scala's);
+  - compile-time checking of `f` format specs against the value types, like scalac;
+  - custom interpolators (`json"..."`, `sql"..."`), e.g. a static method per prefix.
 
 - **`forj { ... } do { ... }`:** the side-effect form without `yield`. Needs a
   `forjForeach` method in each monad instance.
