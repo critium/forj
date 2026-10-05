@@ -344,65 +344,109 @@ final class SourceRewriter {
         return result;
     }
 
-    // ------------------------------------------------- (using T x)  and  f(...) using T x {
+    // ------------------------------------------------ f(...)(using T x)  and  f(using T x)
 
     private static void findUsings(List<Token> tokens, List<Edit> edits) {
-        for (int i = 1; i + 2 < tokens.size(); i++) {
-            Token t = tokens.get(i);
-            if (!isName(t, USING) || tokens.get(i + 1).kind != TokenKind.IDENTIFIER) {
-                continue;
-            }
-            TokenKind prev = tokens.get(i - 1).kind;
-            if (prev == TokenKind.LPAREN || prev == TokenKind.COMMA) {
-                // inside a parameter list: `(List<A> xs, using Ordering<A> ord)`
-                edits.add(new Edit(t.pos, t.endPos, USING_ANNOTATION.strip(), 0, Kind.TEXT));
-            } else if (prev == TokenKind.RPAREN) {
+        for (int i = 2; i + 2 < tokens.size(); i++) {
+            if (isName(tokens.get(i), USING) && tokens.get(i + 1).kind == TokenKind.IDENTIFIER
+                    && tokens.get(i - 1).kind == TokenKind.LPAREN
+                    && (tokens.get(i - 2).kind == TokenKind.RPAREN || tokens.get(i - 2).kind == TokenKind.IDENTIFIER)) {
                 usingClause(tokens, i, edits);
             }
         }
     }
 
     /**
-     * Scala-style clause after the parameter list, {@code max(List<A> xs) using Ordering<A> ord {},
-     * moved into the parameter list as trailing {@code @forj.Using} parameters.
+     * Scala 3's using clause. After other parameters it is merged into their list; as the only
+     * list it stays where it is. In a declaration every parameter gets {@code @forj.Using}:
+     * {@code f(F<A> a)(using Monad<F> m, Show<A> s)} becomes
+     * {@code f(F<A> a, @forj.Using Monad<F> m, @forj.Using Show<A> s)}. At a call site the
+     * instances are passed explicitly: {@code f(x)(using m, s)} becomes {@code f(x, m, s)}.
      */
     private static void usingClause(List<Token> tokens, int using, List<Edit> edits) {
-        Token rparen = tokens.get(using - 1);
-        boolean noParams = tokens.get(using - 2).kind == TokenKind.LPAREN;
-        int angles = 0;
-        int end = -1;
+        int close = closingParen(tokens, using + 1);
+        if (close < 0) {
+            return;
+        }
+        List<Token> commas = parameterCommas(tokens, using + 1, close);
+        boolean declaration = true;
+        int entryStart = using + 1;
+        for (Token comma : commas) {
+            int at = tokens.indexOf(comma);
+            declaration &= isParameter(tokens, entryStart, at - 1);
+            entryStart = at + 1;
+        }
+        declaration &= isParameter(tokens, entryStart, close - 1);
+        Token u = tokens.get(using);
+        String replacement = declaration ? USING_ANNOTATION.strip() : "";
+        if (tokens.get(using - 2).kind == TokenKind.RPAREN) {
+            // `)(using` -> `, @forj.Using` (`, ` at a call); with no other parameters, nothing before it
+            boolean noParams = tokens.get(using - 3).kind == TokenKind.LPAREN;
+            edits.add(new Edit(tokens.get(using - 2).pos, u.endPos, (noParams ? "" : ", ") + replacement, 0, Kind.TEXT));
+        } else {
+            edits.add(new Edit(u.pos, u.endPos, replacement, 0, Kind.TEXT));
+        }
+        if (declaration) {
+            for (Token comma : commas) {
+                edits.add(new Edit(comma.endPos, comma.endPos, " " + USING_ANNOTATION.strip(), 0, Kind.TEXT));
+            }
+        }
+    }
+
+    /** Index of the {@code )} closing the parentheses that {@code from} is inside, or -1. */
+    private static int closingParen(List<Token> tokens, int from) {
+        int depth = 0;
+        for (int j = from; j < tokens.size(); j++) {
+            switch (tokens.get(j).kind) {
+                case LPAREN -> depth++;
+                case RPAREN -> {
+                    if (depth-- == 0) {
+                        return j;
+                    }
+                }
+                case EOF -> {
+                    return -1;
+                }
+                default -> {}
+            }
+        }
+        return -1;
+    }
+
+    /** Whether the entry [start, end] looks like {@code Type name}, not an expression. */
+    private static boolean isParameter(List<Token> tokens, int start, int end) {
+        if (end <= start || tokens.get(end).kind != TokenKind.IDENTIFIER) {
+            return false;
+        }
+        return switch (tokens.get(end - 1).kind) {
+            case IDENTIFIER, GT, GTGT, GTGTGT, RBRACKET, BYTE, SHORT, CHAR, INT, LONG, FLOAT, DOUBLE, BOOLEAN -> true;
+            default -> false;
+        };
+    }
+
+    /** Commas in [from, to) that separate parameters or arguments (outside generics and parentheses). */
+    private static List<Token> parameterCommas(List<Token> tokens, int from, int to) {
         List<Token> commas = new ArrayList<>();
-        for (int j = using + 1; j < tokens.size() && end < 0; j++) {
+        int angles = 0;
+        int parens = 0;
+        for (int j = from; j < to; j++) {
             Token t = tokens.get(j);
             switch (t.kind) {
+                case LPAREN, LBRACE, LBRACKET -> parens++;
+                case RPAREN, RBRACE, RBRACKET -> parens--;
                 case LT -> angles++;
                 case GT -> angles--;
                 case GTGT -> angles -= 2;
                 case GTGTGT -> angles -= 3;
                 case COMMA -> {
-                    if (angles == 0) {
+                    if (angles <= 0 && parens == 0) {
                         commas.add(t);
-                    }
-                }
-                case LBRACE, SEMI, THROWS -> {
-                    if (angles == 0) {
-                        end = j;
                     }
                 }
                 default -> {}
             }
         }
-        if (end < 0) {
-            return;
-        }
-        Token u = tokens.get(using);
-        edits.add(new Edit(rparen.pos, rparen.endPos, noParams ? " " : ",", 0, Kind.TEXT));
-        edits.add(new Edit(u.pos, u.endPos, USING_ANNOTATION.strip(), 0, Kind.TEXT));
-        for (Token comma : commas) {
-            edits.add(new Edit(comma.endPos, comma.endPos, " " + USING_ANNOTATION.strip(), 0, Kind.TEXT));
-        }
-        int at = tokens.get(end).pos;
-        edits.add(new Edit(at, at, ") ", 0, Kind.TEXT));
+        return commas;
     }
 
     // ------------------------------------------------------- F<_> and F<A>

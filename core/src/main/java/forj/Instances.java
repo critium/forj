@@ -7,6 +7,7 @@ import forj.data.Unit;
 import forj.typeclass.Applicative;
 import forj.typeclass.FunctorFilter;
 import forj.typeclass.Monad;
+import forj.typeclass.Monoid;
 import forj.typeclass.Sync;
 import forj.typeclass.Traverse;
 import java.util.ArrayList;
@@ -14,6 +15,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Callable;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
@@ -34,6 +36,30 @@ public final class Instances {
 
     @Given
     public static final CallableInstances callable = new CallableInstances();
+
+    // ------------------------------------------------------------------ Monoids
+
+    /** Integers combine by addition. */
+    @Given
+    public static final Monoid<Integer> intSum = Monoid.of(0, Integer::sum);
+
+    /** Longs combine by addition. */
+    @Given
+    public static final Monoid<Long> longSum = Monoid.of(0L, Long::sum);
+
+    /** Strings combine by concatenation. */
+    @Given
+    public static final Monoid<String> string = Monoid.of("", String::concat);
+
+    /** Lists combine by concatenation. */
+    @Given
+    public static <A> Monoid<List<A>> listConcat() {
+        return Monoid.of(List.of(), (xs, ys) -> {
+            List<A> out = new ArrayList<>(xs);
+            out.addAll(ys);
+            return Collections.unmodifiableList(out);
+        });
+    }
 
     // ---------------------------------------------------------------------- List
 
@@ -67,6 +93,15 @@ public final class Instances {
         @Override
         public <A> Kind<List, A> filter(Kind<List, A> fa, Predicate<? super A> p) {
             return new ListK<>(ListK.narrow(fa).stream().filter(p).map(a -> (A) a).toList());
+        }
+
+        @Override
+        public <A, B> B foldLeft(Kind<List, A> fa, B initial, BiFunction<? super B, ? super A, ? extends B> f) {
+            B acc = initial;
+            for (A a : ListK.narrow(fa)) {
+                acc = f.apply(acc, a);
+            }
+            return acc;
         }
 
         @Override
@@ -107,6 +142,12 @@ public final class Instances {
         @Override
         public <A> Kind<Optional, A> filter(Kind<Optional, A> fa, Predicate<? super A> p) {
             return new OptionalK<>(OptionalK.narrow(fa).filter(p));
+        }
+
+        @Override
+        public <A, B> B foldLeft(Kind<Optional, A> fa, B initial, BiFunction<? super B, ? super A, ? extends B> f) {
+            Optional<A> o = OptionalK.narrow(fa);
+            return o.isEmpty() ? initial : f.apply(initial, o.get());
         }
 
         @Override

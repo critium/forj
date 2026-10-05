@@ -996,6 +996,11 @@ final class ImplicitResolver {
         if (pattern.getTypeArguments().nonEmpty() && pattern.tsym != null) {
             Type sup = types.asSuper(actual, pattern.tsym);
             if (sup == null) {
+                // a given returning a subtype of what's needed (Monoid<List<A>> for a Semigroup<List<Integer>>)
+                Type viewed = actual.tsym == null ? null : types.asSuper(pattern, actual.tsym);
+                if (viewed != null && viewed.tsym != pattern.tsym) {
+                    unify(viewed, actual, bindings, tvars);
+                }
                 return;
             }
             var ps = pattern.getTypeArguments();

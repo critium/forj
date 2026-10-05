@@ -91,7 +91,7 @@ public final class DashboardServer implements AutoCloseable {
     record Parts(String profile, String orders, String recommendations) {}
 
     /** Describes the dashboard for {@code user}; no request is made until {@code call()}. */
-    Callable<String> dashboard(String user) using RequestContext request {
+    Callable<String> dashboard(String user)(using RequestContext request) {
         return forj {
             parts <- Par.mapN(
                     get("/profile/" + user),
@@ -110,7 +110,7 @@ public final class DashboardServer implements AutoCloseable {
         return inner.isEmpty() ? 0 : inner.split(",").length;
     }
 
-    private Callable<String> get(String path) using RequestContext request {
+    private Callable<String> get(String path)(using RequestContext request) {
         return () -> {
             HttpRequest http = HttpRequest.newBuilder(uri().resolve(path))
                     .header(RequestContext.TRACE_HEADER, request.traceId())

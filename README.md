@@ -32,11 +32,14 @@ public interface Show<A> {
     String show(A a);
     given Show<Integer> integer = i -> Integer.toString(i);
     given <A> Show<List<A>> list(using Show<A> element) { ... }
-    static <A> String show(A a) using Show<A> s { return s.show(a); }
+    static <A> String show(A a)(using Show<A> s) { return s.show(a); }
 }
 
 Show.show(List.of(1, 2));   // the plugin passes Show.list(Show.integer); no instance, no build
 ```
+
+Callers can still pass an instance themselves (`Show.show(xs)(using hexShow)`). For code that
+must parse in any Java editor, `@Using`/`@Given` annotations do the same as the keywords.
 
 And Scala's string interpolation:
 
@@ -60,7 +63,7 @@ public interface Inventory<F<_>> {                       // an algebra, in any e
     F<Unit> reserve(String item, int quantity);
 }
 
-public static <F<_>> F<Receipt> checkout(Order order) using Sync<F> sync, Inventory<F> inventory, Payments<F> payments {
+public static <F<_>> F<Receipt> checkout(Order order)(using Sync<F> sync, Inventory<F> inventory, Payments<F> payments) {
     return forj {
         available <- inventory.stock(order.item());
         _ <- available >= order.quantity() ? sync.unit() : sync.<Unit>raiseError(new OutOfStock(...));
@@ -162,7 +165,7 @@ Set `def forjDebug = true` to print each desugared comprehension during compilat
 |---|---|
 | `core/` | `forj.Kind` and the type class ladder (`forj.typeclass`), the `IO` effect (`forj.effect`), instances for JDK types (`forj.Instances`), what comprehensions compile to (`forj.For`), `forj.Par`, `@Given`/`@Using`/`@Lower`. No dependencies. |
 | `plugin/` | The javac plugin: `SourceRewriter` and `Interpolations` (text stage), `Desugarer` (forj blocks), `ImplicitResolver` (`given`/`using`), and the glue that installs them into javac. |
-| `examples/` | Example code and tests: a third-party monad (`StreamMonad`), a small HTTP server (`http/`), type classes with `given`/`using` (`typeclasses/`), one comprehension for any monad (`hkt/`), and tagless final with two interpreters (`tagless/`). |
+| `examples/` | Example code and tests: a third-party monad (`StreamMonad`), a small HTTP server (`http/`), type classes with `given`/`using` (`typeclasses/`), generic code over any `F` and any value type: `Monad`, `Applicative`, `Semigroup`/`Monoid`, `Traverse` (`hkt/`), and tagless final with two interpreters (`tagless/`). |
 | `bin/fetch-jdk` | Downloads and verifies the pinned JDK, then runs `bin/make-preview-jdk`. |
 | `TODO.md` | Known issues and planned work. |
 

@@ -19,7 +19,7 @@ public interface Show<A> {
         return o -> o.map(a -> "Some(" + value.show(a) + ")").orElse("None");
     }
 
-    static <A> String show(A a) using Show<A> s {
+    static <A> String show(A a)(using Show<A> s) {
         return s.show(a);
     }
 }

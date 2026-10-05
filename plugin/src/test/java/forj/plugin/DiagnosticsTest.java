@@ -145,7 +145,7 @@ class DiagnosticsTest {
         var errors = errors("""
                 return needsConcurrent(new forj.data.CallableK<>(() -> 1));
                 }
-                static <F<_>> F<Integer> needsConcurrent(F<Integer> fa) using forj.typeclass.Concurrent<F> c {
+                static <F<_>> F<Integer> needsConcurrent(F<Integer> fa)(using forj.typeclass.Concurrent<F> c) {
                     return fa;
                 """);
         assertTrue(errors.stream().anyMatch(e -> e.contains("forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>")),

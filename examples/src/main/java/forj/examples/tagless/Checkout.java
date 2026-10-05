@@ -11,7 +11,7 @@ import forj.typeclass.Sync;
 public final class Checkout {
     private Checkout() {}
 
-    public static <F<_>> F<Receipt> checkout(Order order) using Sync<F> sync, Inventory<F> inventory, Payments<F> payments {
+    public static <F<_>> F<Receipt> checkout(Order order)(using Sync<F> sync, Inventory<F> inventory, Payments<F> payments) {
         return forj {
             available <- inventory.stock(order.item());
             _ <- available >= order.quantity()

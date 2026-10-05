@@ -8,7 +8,7 @@ public final class Report {
     private Report() {}
 
     /** Generic code asks for an instance in turn, and passes it on implicitly. */
-    static <A> String line(String label, A value) using Show<A> show {
+    static <A> String line(String label, A value)(using Show<A> show) {
         return label + ": " + Show.show(value);
     }
 

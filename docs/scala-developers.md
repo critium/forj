@@ -63,7 +63,7 @@ Unlike scalac, which calls `flatMap` on the value, forj always goes through a re
 lets one comprehension work for any `F`:
 
 ```java
-static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b) using Monad<F> m {
+static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b)(using Monad<F> m) {
     return forj { x <- a; y <- b; } yield x + y;
 }
 ```
@@ -73,6 +73,14 @@ static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b) using Monad<F> m {
 Arrow-Java, with the raw class as the witness: `Kind<List, A>`, `Monad<IO>`. Types forj owns
 implement `Kind` directly (`IO<A> implements Kind<IO, A>`); JDK types are wrapped
 (`ListK`, `OptionalK`, `CallableK`), which costs an allocation per step.
+
+`examples/.../hkt/Generic.java` takes the same function further: `Applicative` instead of
+`Monad` (`map2`), `Semigroup<A>` for the value, and `combineAll(G<? extends F<A>>)` with
+`Traverse<G>, Applicative<F>, Monoid<A>`, i.e. `fas.sequence.map(_.combineAll)`. A given
+that returns a subtype satisfies the supertype, as in Scala: `Monoid<List<A>>` answers a
+`Semigroup<List<Integer>>`. Like scalac, forj desugars every comprehension to `flatMap`, so a
+comprehension needs `Monad` even when its generators are independent (no `ApplicativeDo`
+yet; see TODO).
 
 As in Scala, every generator in a block must have the same `F`: a `List` generator followed
 by an `Optional` one doesn't compile.
@@ -86,7 +94,8 @@ by an `Optional` one doesn't compile.
 | `ApplicativeError[F, E]`, `MonadError[F, E]` | same |
 | `Bracket[F, E]`, `Sync[F]`, `Async[F]`, `Concurrent[F]` | same (`Sync` is `Bracket<F, Throwable>`) |
 | `Fiber[F, A]` with `join` / `cancel` | same |
-| `Traverse`, `FunctorFilter` | same |
+| `Traverse`, `Foldable`, `FunctorFilter` | same (`Traverse` extends `Foldable`) |
+| `Semigroup`, `Monoid`, `|+|`, `combineAll` | `Semigroup`, `Monoid`, `combine`, `combineAll`; `Monoid.of(empty, combine)` builds one |
 | `IO`, `IO.delay`, `IO.suspend`, `IO.async`, `unsafeRunSync()` | `forj.effect.IO`, same |
 | `IO.race`, `parMapN` | `IO.race`, `IO.parMap2`, `Par.mapN` for `Callable` |
 | `implicit` instances, `F: Sync` context bounds | `given`, `using Sync<F> sync` |
@@ -181,7 +190,8 @@ Scala 3 syntax, resolved at compile time like scalac does:
 |---|---|
 | `given intOrd: Ordering[Int] = ...` | `given Ordering<Integer> intOrd = ...;` |
 | `given listOrd[A](using Ordering[A]): Ordering[List[A]] = ...` | `given <A> Ordering<List<A>> listOrd(using Ordering<A> elem) { ... }` |
-| `def max[A](xs: List[A])(using ord: Ordering[A]): A` | `static <A> A max(List<A> xs) using Ordering<A> ord { ... }` |
+| `def max[A](xs: List[A])(using ord: Ordering[A]): A` | `static <A> A max(List<A> xs)(using Ordering<A> ord) { ... }` |
+| `max(xs)(using Ordering.Int.reverse)` | `max(xs)(using reversed)` (passed explicitly, no resolution) |
 | `summon[Ordering[Int]]` | `Implicits.<Ordering<Integer>>summon()` |
 | `import Instances.given` | `import static Instances.*;` |
 
@@ -212,7 +222,9 @@ context is a compile error, and lazy `Callable`s capture it when they are built.
 
 Under the hood: `given` compiles to a `public static` member annotated `@forj.Given`, `using`
 to a trailing parameter annotated `@forj.Using`. Both annotations are kept in class files, so
-libraries can ship instances. At each call that leaves `using` arguments out, the plugin type
+libraries can ship instances. You can also write the annotations yourself
+(`f(A a, @Using Show<A> s)`, `@Given static final Show<Integer> integer = ...;`): that is plain
+Java, so editors without forj support parse it cleanly. At each call that leaves `using` arguments out, the plugin type
 checks copies of the arguments, infers the method's type parameters, resolves the givens and
 inserts them; javac then type checks the call as written out in full.
 

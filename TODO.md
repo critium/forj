@@ -81,6 +81,12 @@ Editors parse `.java` files with their own parsers, without the plugin, so `forj
 and `x <- e;` show up as syntax errors, and completion and hover don't work inside forj blocks.
 `./mill` builds are unaffected.
 
+What already parses as plain Java, for code that must stay editor friendly: `@Using` and
+`@Given` instead of the `using`/`given` keywords, `<F>` with `Kind<F, A>` instead of `<F<_>>`
+with `F<A>` (`F<A>` alone parses, it only fails type checking). Calls that leave `using`
+arguments out still show as type errors. `forj { }`, `<-` and `s"..."` have no plain-Java
+spelling.
+
 ### IntelliJ IDEA
 
 - Write an IntelliJ plugin that teaches the Java PSI the forj syntax. Two routes:
@@ -135,7 +141,7 @@ retroactive instances. These are the gaps, most valuable first.
 
 1. **Return-type polymorphism.** Done for a typed local, a `return` and an assignment
    (`IO<Receipt> p = checkout(order);` infers `F = IO`). Still missing: from an argument
-   position, and a `Monoid` example (`empty`, `combine`, `combineAll`).
+   position. (`Semigroup`/`Monoid`/`Foldable` are done; see `hkt/Generic.combineAll`.)
 2. **Higher-kinded type classes.** Done: `Kind<F, A>` with raw classes as witnesses, the CE2
    ladder in `forj.typeclass`, `IO`, `F<_>` syntax, comprehensions through `Monad<F>`.
    Follow-ups:
@@ -150,8 +156,34 @@ retroactive instances. These are the gaps, most valuable first.
 4. **Coherence (decide, don't necessarily build).** Like Scala, forj allows more than one
    instance per type (local givens), so a value can be shown differently at different call
    sites. Haskell forbids that. Decide whether to offer a strict mode.
-5. **A better type class example.** `Show` is little more than `Function<A, String>`; add
-   `Monoid` (after 1). `Functor`/`Monad` now exist (`hkt/`, `tagless/`).
+5. **Applicative comprehensions (`ApplicativeDo`).** Today every comprehension becomes a
+   chain of `flatMap`, so it needs `Monad<F>` even when its generators don't depend on each
+   other:
+
+   ```java
+   forj { x <- a; y <- b; } yield x + y;     // b doesn't use x: map2(a, b, ...) is enough
+   ```
+
+   The desugarer would look at which earlier binders each generator (and guard and value
+   definition) mentions, group the independent ones into `forjMap2`/`forjMapN` calls that
+   need only `Applicative<F>`, and use `flatMap` only where a step really depends on an
+   earlier one. Wins:
+   - generic code can ask for `Applicative` and still use the syntax (works for
+     applicatives with no `Monad`, like an error-accumulating `Validated`);
+   - an effect's `Applicative` could run independent steps at the same time: `IO`'s
+     `map2` would become `parMap2`, the way the dashboard example uses `Par.mapN` by hand
+     today. That is a semantic choice (cats keeps `IO`'s `map2` sequential and puts the
+     parallel one in `Parallel`), so it probably wants a separate `parForj { }` or a
+     `Parallel<F>` instance rather than changing `forj { }`.
+
+   Needs: a free-variable analysis of each step (binders are plain identifiers, so a
+   `TreeScanner` over the step's expression suffices, minding shadowing in lambdas),
+   `forjMap2`..`forjMapN` combinators in `For`, and diagnostics that still say `Monad` when
+   a dependent step makes it necessary. Haskell's `ApplicativeDo` is the reference design,
+   including its rule that the final `yield` must be a plain expression of the binders.
+6. **Laws for the value type classes.** `Semigroup` associativity and `Monoid` identity, run
+   against the `forj.Instances` monoids and `Money`, alongside the functor/monad law tests
+   in 2.
 
 ## More Scala syntax
 

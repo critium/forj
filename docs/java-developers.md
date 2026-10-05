@@ -175,15 +175,38 @@ interface Functor<F<_>> {                                    // F takes a type
     <A, B> F<B> map(F<A> fa, Function<? super A, ? extends B> f);
 }
 
-static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b) using Monad<F> m {
+static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b)(using Monad<F> m) {
     return forj { x <- a; y <- b; } yield x + y;             // one comprehension, any monad
 }
 ```
 
 Under the hood `F<A>` is `forj.Kind<F, A>`, and `F` is the raw class standing for the type
 constructor (`List`, `Optional`, `IO`). `addBoth` works for lists (every combination),
-optionals (both or nothing) and `IO` (one after the other, when run). See
-`examples/.../hkt/Generic.java`.
+optionals (both or nothing) and `IO` (one after the other, when run).
+
+Generic code is most useful when it asks for as little as it can. `examples/.../hkt/Generic.java`
+loosens `addBoth` one step at a time:
+
+```java
+// b doesn't depend on a's value, so Applicative is enough (no comprehension: those need Monad)
+static <F<_>> F<Integer> addIndependent(F<Integer> a, F<Integer> b)(using Applicative<F> ap) {
+    return ap.map2(a, b, Integer::sum);
+}
+
+// generic in the value too: "add" is whichever Semigroup<A> the call site finds
+static <F<_>, A> F<A> combineBoth(F<A> a, F<A> b)(using Applicative<F> ap, Semigroup<A> s) {
+    return ap.map2(a, b, s::combine);
+}
+
+// and in how many: run every F in a list (or optional, ...) and combine the results
+static <G<_>, F<_>, A> F<A> combineAll(G<? extends F<A>> fas)(using Traverse<G> t, Applicative<F> ap, Monoid<A> m)
+```
+
+`combineBoth` adds integers, concatenates strings and lists, and sums `Money`, all picked by
+the value type at compile time. `combineAll` of a `List<IO<Integer>>` is an `IO<Integer>`
+holding the total, and `empty()` (`0`) for an empty list. `forj.Instances` has monoids for
+`Integer` and `Long` (sum), `String` and `List` (concatenation); your own types bring theirs:
+`given Monoid<Money> sum = Monoid.of(new Money(0), ...)` inside `Money`.
 
 ## Effects: `IO` and the capability ladder
 
@@ -212,6 +235,10 @@ Generic code asks for capabilities, from the least to the most:
 | `Async` | `async` | wait for a callback |
 | `Concurrent` | `start`, `race`, `parMap2` | do things at the same time |
 
+Beside the ladder: `FunctorFilter` (`filter`, for guards), `Foldable` (`foldLeft`,
+`combineAll`), `Traverse` (`traverse`, `sequence`), and for values `Semigroup` (`combine`) and
+`Monoid` (`combine` plus `empty`).
+
 Each extends the one above it. `IO` has them all; `Callable` stops at `Sync`. Asking for a
 capability the effect doesn't have is a compile error.
 
@@ -226,7 +253,7 @@ public interface Inventory<F<_>> {
     F<Unit> reserve(String item, int quantity);
 }
 
-static <F<_>> F<Receipt> checkout(Order order) using Sync<F> sync, Inventory<F> inventory, Payments<F> payments {
+static <F<_>> F<Receipt> checkout(Order order)(using Sync<F> sync, Inventory<F> inventory, Payments<F> payments) {
     return forj { ... } yield new Receipt(order, transaction);
 }
 ```
@@ -295,7 +322,7 @@ public interface Show<A> {
         return xs -> xs.stream().map(element::show).toList().toString();
     }
 
-    static <A> String show(A a) using Show<A> s {                       // asks for one
+    static <A> String show(A a)(using Show<A> s) {                       // asks for one
         return s.show(a);
     }
 }
@@ -305,8 +332,19 @@ Show.show(List.of(1, 2));   // "[1, 2]"
 
 - **`given`** declares an instance. In a class it becomes a `public static` member (write
   `private` or another modifier to change that).
-- **`using`** declares a parameter that callers leave out: after the parameter list
-  (`f(A a) using Show<A> s`), or inside it (`f(A a, using Show<A> s)`).
+- **`using`** declares parameters that callers leave out, in their own parentheses after
+  the ordinary ones, as in Scala 3: `f(A a)(using Show<A> s)`, or several:
+  `f(A a)(using Show<A> s, Ord<A> o)`. A caller can still pass them, which skips resolution:
+  `show(a)(using hexShow)`.
+- **Plain-Java alternative:** `@Using` on the parameters and `@Given` on the instances
+  (`import forj.Given; import forj.Using;`). It's what the keywords compile to, so it behaves
+  the same, but it's ordinary Java: editors without forj support parse it without errors
+  (they only flag calls that leave the arguments out).
+
+  ```java
+  static <A> String show(A a, @Using Show<A> s) { ... }      // = show(A a)(using Show<A> s)
+  @Given public static final Show<Integer> integer = ...;    // = given Show<Integer> integer = ...;
+  ```
 - **At each call** the plugin works out the type the parameter needs (`Show<List<Integer>>`
   above), finds a given for it, and passes it: here `Show.list(Show.integer)`. If none
   exists, or two do, the build fails:
@@ -365,7 +403,7 @@ given Show<Integer> hex = ...;
 Show.show(List.of(10, 11));                      // "[0xa, 0xb]"      Show.list(hex)
 
 // generic code uses its caller's instance
-static <A> String twice(A a) using Show<A> show { return Show.show(a) + " " + Show.show(a); }
+static <A> String twice(A a)(using Show<A> show) { return Show.show(a) + " " + Show.show(a); }
 
 twice(7);                                        // "7 7"             twice(7, Show.integer)
 given Show<Integer> roman = i -> i == 7 ? "VII" : "?";
@@ -415,7 +453,7 @@ private void dashboard(HttpExchange exchange) {
 }
 
 // everything below asks for it instead of taking it as an argument
-Callable<String> dashboard(String user) using RequestContext request {
+Callable<String> dashboard(String user)(using RequestContext request) {
     return forj {
         parts <- Par.mapN(get("/profile/" + user), get("/orders/" + user),
                           get("/recommendations/" + user), Parts::new);
@@ -423,7 +461,7 @@ Callable<String> dashboard(String user) using RequestContext request {
     } yield ...;
 }
 
-private Callable<String> get(String path) using RequestContext request {
+private Callable<String> get(String path)(using RequestContext request) {
     return () -> ... .header("X-Trace-Id", request.traceId()) ...;
 }
 ```

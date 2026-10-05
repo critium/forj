@@ -88,7 +88,7 @@ class ImplicitsTest {
                     };
                 }
 
-                public static <A> A max(List<A> xs) using Ord<A> ord {
+                public static <A> A max(List<A> xs)(using Ord<A> ord) {
                     A best = xs.getFirst();
                     for (A x : xs) if (ord.compare(x, best) > 0) best = x;
                     return best;
@@ -125,6 +125,117 @@ class ImplicitsTest {
     }
 
     @Test
+    void aGenericGivenReturningASubtypeSatisfiesTheSupertype() throws Exception {
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.typeclass.Monoid;
+                import forj.typeclass.Semigroup;
+                import java.util.List;
+                public class App {
+                    static <A> A twice(A a)(using Semigroup<A> s) { return s.combine(a, a); }
+                    // forj.Instances.listConcat() returns a Monoid<List<A>>
+                    public static Object run() { return twice(List.of(1, 2)); }
+                }
+                """));
+        assertEquals(List.of(1, 2, 1, 2), c.call("app.App", "run"));
+    }
+
+    @Test
+    void aSeparateUsingClauseLikeScala3() throws Exception {
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.typeclass.Monoid;
+                import forj.typeclass.Semigroup;
+                import java.util.List;
+                import java.util.Map;
+                public class App {
+                    interface Describe<A> { String describe(A a); }
+                    given Describe<Map<String, Integer>> sizes = m -> m.size() + " entries";
+
+                    static <A> A twice(A a)(using Semigroup<A> s) { return s.combine(a, a); }
+                    static <A> A none()(using Monoid<A> m) { return m.empty(); }
+                    // a comma inside the generics doesn't start a new parameter
+                    static <A> String both(A a, Map<String, Integer> m)(using Semigroup<A> s, Describe<Map<String, Integer>> d) {
+                        return s.combine(a, a) + " / " + d.describe(m);
+                    }
+                    public static Object run() {
+                        Integer zero = none();
+                        return List.of(twice(21), zero, both("ab", Map.of("x", 1)));
+                    }
+                }
+                """));
+        assertEquals(List.of(42, 0, "abab / 1 entries"), c.call("app.App", "run"));
+    }
+
+    @Test
+    void passingAnInstanceExplicitlyOverridesResolution() throws Exception {
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.typeclass.Monoid;
+                import forj.typeclass.Semigroup;
+                import java.util.List;
+                public class App {
+                    static final Monoid<Integer> product = Monoid.of(1, (a, b) -> a * b);
+                    static <A> A twice(A a)(using Semigroup<A> s) { return s.combine(a, a); }
+                    static <A> A none()(using Monoid<A> m) { return m.empty(); }
+                    // the using clause as the only list, as in Scala 3's `def f(using ...)`
+                    static <A> A emptyTwice(using Monoid<A> m, Semigroup<A> s) { return s.combine(m.empty(), m.empty()); }
+                    public static Object run() {
+                        Integer one = none()(using product);
+                        Integer two = emptyTwice(using product, Monoid.of(0, Integer::sum));
+                        Integer zero = emptyTwice();
+                        return List.of(twice(5), twice(5)(using product), twice(5)(using Monoid.of(0, Integer::max)), one, two, zero);
+                    }
+                }
+                """));
+        assertEquals(List.of(10, 25, 5, 1, 2, 0), c.call("app.App", "run"));
+    }
+
+    @Test
+    void usingOnlyWorksAsItsOwnClause() throws Exception {
+        // the pre-Scala-3 spellings `f(A a) using T t {` and `f(A a, using T t)` are not forj syntax
+        for (String signature : List.of("static <A> A twice(A a) using Semigroup<A> s",
+                "static <A> A twice(A a, using Semigroup<A> s)")) {
+            var c = compile(Map.of("app/App.java", """
+                    package app;
+                    import forj.typeclass.Semigroup;
+                    public class App {
+                        %s { return s.combine(a, a); }
+                    }
+                    """.formatted(signature)));
+            assertTrue(!c.errors().isEmpty(), signature);
+        }
+    }
+
+    @Test
+    void thePlainJavaSpellingWorksToo() throws Exception {
+        // what `<F<_>>`, `F<A>`, `using` and `given` rewrite to; parses as ordinary Java
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.Given;
+                import forj.Kind;
+                import forj.Using;
+                import forj.data.OptionalK;
+                import forj.typeclass.Applicative;
+                import forj.typeclass.Monoid;
+                import forj.typeclass.Semigroup;
+                import java.util.Optional;
+                public class App {
+                    @Given static final Monoid<Integer> product = Monoid.of(1, (a, b) -> a * b);
+                    static <F, A> Kind<F, A> combineBoth(Kind<F, A> a, Kind<F, A> b,
+                                                         @Using Applicative<F> ap, @Using Semigroup<A> s) {
+                        return ap.map2(a, b, s::combine);
+                    }
+                    public static Object run() {
+                        Kind<Optional, Integer> r = combineBoth(new OptionalK<>(Optional.of(3)), new OptionalK<>(Optional.of(4)));
+                        return OptionalK.narrow(r);
+                    }
+                }
+                """));
+        assertEquals(java.util.Optional.of(12), c.call("app.App", "run"));
+    }
+
+    @Test
     void forwardsTheEnclosingMethodsUsingParameter() throws Exception {
         var c = compile(Map.of("lib/Ord.java", ORD, "lib/Ords.java", ORDS, "app/App.java", """
                 package app;
@@ -132,7 +243,7 @@ class ImplicitsTest {
                 import lib.Ord;
                 import java.util.List;
                 public class App {
-                    static <A> A larger(A a, A b) using Ord<A> ord {
+                    static <A> A larger(A a, A b)(using Ord<A> ord) {
                         return max(List.of(a, b));       // gets `ord`, not a global given
                     }
                     public static Object run() {
@@ -151,7 +262,7 @@ class ImplicitsTest {
                         public interface Show<A> {
                             String show(A a);
                             given Show<Integer> integer = i -> "#" + i;
-                            static <A> String render(A a) using Show<A> s { return s.show(a); }
+                            static <A> String render(A a)(using Show<A> s) { return s.show(a); }
                         }
                         """,
                 "lib/Money.java", """
@@ -260,7 +371,7 @@ class ImplicitsTest {
                 package app;
                 import lib.Ord;
                 public class App {
-                    static <A> int same() using Ord<A> ord { return 0; }
+                    static <A> int same()(using Ord<A> ord) { return 0; }
                     public static Object run() { return same(); }
                 }
                 """));

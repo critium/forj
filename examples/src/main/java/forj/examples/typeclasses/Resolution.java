@@ -47,7 +47,7 @@ public final class Resolution {
     }
 
     /** Generic code uses whatever its caller had in scope, via its using parameter. */
-    static <A> String twice(A a) using Show<A> show {
+    static <A> String twice(A a)(using Show<A> show) {
         return Show.show(a) + " " + Show.show(a);                  // `show`, the caller's choice
     }
 
