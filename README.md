@@ -23,6 +23,20 @@ in by providing three static methods (`forjFlatMap`, `forjMap`, and optionally `
 `forj.Par` adds parallel calls on structured concurrency, in the style of cats-effect's
 `parMapN`.
 
+It also brings Scala 3's `given`/`using`: type classes and context parameters, resolved at
+compile time:
+
+```java
+public interface Show<A> {
+    String show(A a);
+    given Show<Integer> integer = i -> Integer.toString(i);
+    given <A> Show<List<A>> list(using Show<A> element) { ... }
+    static <A> String show(A a) using Show<A> s { return s.show(a); }
+}
+
+Show.show(List.of(1, 2));   // the plugin passes Show.list(Show.integer); no instance, no build
+```
+
 - New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
 - Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
 
@@ -50,6 +64,10 @@ List<String> labels = forj {
 2. **After parsing, before type checking**, it desugars each block the way scalac does:
    every generator but the last becomes `forjFlatMap`, the last becomes `forjMap`, and
    guards become `forjFilter`. javac then type checks the result as ordinary Java.
+3. **Just before javac type checks each class**, it fills in `using` arguments that calls
+   leave out. It type checks copies of the call's arguments to infer the method's type
+   parameters, searches for a `given` of each required type (recursively, for givens that
+   have `using` parameters of their own), and inserts it. No match, or two, fails the build.
 
 The runtime library is small: `forj.For` holds the monad instances for JDK types and a
 one-line `run` helper, and `forj.Par` holds the parallel combinators.
@@ -98,9 +116,9 @@ Set `def forjDebug = true` to print each desugared comprehension during compilat
 
 | Path | What it is |
 |---|---|
-| `core/` | `forj.For`: monad instances for `Optional`, `List`, `Callable`. `forj.Par`: parallel combinators. No dependencies. |
-| `plugin/` | The javac plugin: `SourceRewriter` (text stage), `Desugarer` (tree stage), and the glue that installs them into javac. |
-| `examples/` | Example code and tests, including a third-party monad instance (`StreamMonad`) and a small HTTP server (`http/DashboardServer`). |
+| `core/` | `forj.For`: monad instances for `Optional`, `List`, `Callable`. `forj.Par`: parallel combinators. `@Given`, `@Using` and `Implicits.summon`. No dependencies. |
+| `plugin/` | The javac plugin: `SourceRewriter` (text stage), `Desugarer` (forj blocks), `ImplicitResolver` (`given`/`using`), and the glue that installs them into javac. |
+| `examples/` | Example code and tests: a third-party monad instance (`StreamMonad`), a small HTTP server (`http/DashboardServer`), and type classes with `given`/`using` (`typeclasses/`). |
 | `bin/fetch-jdk` | Downloads and verifies the pinned JDK, then runs `bin/make-preview-jdk`. |
 | `TODO.md` | Known issues and planned work. |
 

@@ -38,7 +38,7 @@ trait ForjTests extends PinnedJdk with TestModule.Junit5 {
 }
 
 /** javac internals the plugin compiles against. */
-val javacInternals = Seq("api", "code", "main", "parser", "tree", "util")
+val javacInternals = Seq("api", "code", "comp", "main", "parser", "tree", "util")
   .map(p => s"--add-exports=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
 
 /** JVM flags for any JVM that runs javac with the plugin: it also swaps javac's parser factory. */

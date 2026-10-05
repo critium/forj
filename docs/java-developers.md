@@ -159,6 +159,167 @@ No plugin changes are needed: the generated code calls `forjFlatMap(...)` unqual
 and javac's normal overload resolution picks the right one from your static imports.
 The JDK types (`Optional`, `List`, `Callable`) are imported automatically.
 
+## Type classes with `given` and `using`
+
+A *type class* is an interface describing something a type can do, like `Comparator`, but
+looked up by type instead of passed by hand. forj finds the right implementation at compile
+time.
+
+```java
+public interface Show<A> {
+    String show(A a);
+
+    given Show<Integer> integer = i -> Integer.toString(i);              // an instance
+
+    given <A> Show<List<A>> list(using Show<A> element) {                // built from another
+        return xs -> xs.stream().map(element::show).toList().toString();
+    }
+
+    static <A> String show(A a) using Show<A> s {                       // asks for one
+        return s.show(a);
+    }
+}
+
+Show.show(List.of(1, 2));   // "[1, 2]"
+```
+
+- **`given`** declares an instance. In a class it becomes a `public static` member (write
+  `private` or another modifier to change that).
+- **`using`** declares a parameter that callers leave out: after the parameter list
+  (`f(A a) using Show<A> s`), or inside it (`f(A a, using Show<A> s)`).
+- **At each call** the plugin works out the type the parameter needs (`Show<List<Integer>>`
+  above), finds a given for it, and passes it: here `Show.list(Show.integer)`. If none
+  exists, or two do, the build fails:
+
+  ```
+  forj: no given Show<java.time.Instant> for show
+  forj: ambiguous givens for Show<java.lang.Integer>: [Report.natural, Report.reversed]
+  ```
+
+  (javac then adds its own "cannot be applied" error for the same call.)
+
+### Which given is picked
+
+There can be many givens of the same type: `Show.integer` next to the type class, a
+`given Show<Integer> hex` in some method, another in a class. The plugin picks by two
+things, in order:
+
+1. **The type.** Only givens of exactly the required type count. `Show.show(42)` needs a
+   `Show<Integer>`, so `Show<String>` and `Show<Money>` givens are never considered.
+2. **The nearest scope.** Among those, the closest one wins:
+
+| Level | Where | Example |
+|---|---|---|
+| 1 | a local `given` declared earlier in the block | `given Show<Integer> hex = ...;` then `Show.show(255)` gives `0xff` |
+| 2 | the enclosing method's `using` parameters | generic code uses whatever its caller had |
+| 3 | givens in the enclosing classes | `Accounting.ledger` formats money inside `Accounting` |
+| 4 | givens brought in with `import static` | `import static ...Euro.*;` formats money in euros |
+| 5 | givens next to the type class or the data type | `Show.integer`, `Money.show`: the defaults, found without imports |
+
+Two matches at the *same* level is a compile error, never a guess.
+
+All of these are runnable in `examples/.../typeclasses/Resolution.java` and
+`ImportedGivens.java`, with the expected output in `ResolutionTest`:
+
+```java
+// by type: three different instances for three types
+Show.show(42);                  // "42"      Show.integer
+Show.show("hi");                // "\"hi\""   Show.string
+Show.show(new Money(150));      // "$1.50"   Money.show
+
+// derived instances pick each element's instance
+Show.show(List.of(1, 2));                       // "[1, 2]"          Show.list(Show.integer)
+Show.show(List.of(new Money(100)));             // "[$1.00]"         Show.list(Money.show)
+
+// a local given beats the default, inside its block only
+static String localGiven() {
+    given Show<Integer> hex = i -> "0x" + Integer.toHexString(i);
+    return Show.show(255);                       // "0xff"
+}
+static String withoutLocalGiven() {
+    return Show.show(255);                       // "255"
+}
+
+// ...and it flows into derived instances
+given Show<Integer> hex = ...;
+Show.show(List.of(10, 11));                      // "[0xa, 0xb]"      Show.list(hex)
+
+// generic code uses its caller's instance
+static <A> String twice(A a) using Show<A> show { return Show.show(a) + " " + Show.show(a); }
+
+twice(7);                                        // "7 7"             twice(7, Show.integer)
+given Show<Integer> roman = i -> i == 7 ? "VII" : "?";
+twice(7);                                        // "VII VII"         twice(7, roman)
+
+// a class-level given beats the data type's own
+final class Accounting {
+    given Show<Money> ledger = m -> ...;
+    static String report() { return Show.show(new Money(-420)); }   // "(420c)", not "$-4.20"
+}
+
+// an imported given beats the data type's own
+import static forj.examples.typeclasses.Euro.*;
+Show.show(new Money(1999));                      // "€19,99"          Euro.euros
+
+// passing it yourself always wins: nothing is looked up
+Show.show(3, stars);                             // "***"
+```
+
+And when it can't decide:
+
+```java
+final class Report {
+    given Show<Integer> natural = i -> ...;
+    given Show<Integer> padded = i -> ...;
+    static String r() { return Show.show(1); }
+}
+// forj: ambiguous givens for ...Show<java.lang.Integer>: [Report.natural, Report.padded]
+```
+
+To get an instance directly: `Implicits.<Show<Integer>>summon()`. Instances in compiled
+libraries are found too.
+
+## Context parameters: passing things through without passing them
+
+`using` isn't only for type classes. It also carries context that a lot of code needs and
+nobody wants to thread by hand: the current request, a trace ID, a transaction. The dashboard
+example sends the caller's trace ID to every downstream service:
+
+```java
+public record RequestContext(String traceId) { ... }
+
+// the handler declares it once
+private void dashboard(HttpExchange exchange) {
+    given RequestContext request = RequestContext.from(exchange);
+    respond(exchange, 200, dashboard(user).call());          // `request` passed for us
+}
+
+// everything below asks for it instead of taking it as an argument
+Callable<String> dashboard(String user) using RequestContext request {
+    return forj {
+        parts <- Par.mapN(get("/profile/" + user), get("/orders/" + user),
+                          get("/recommendations/" + user), Parts::new);
+        shipping <- get("/shipping/" + itemCount(parts.orders()));
+    } yield ...;
+}
+
+private Callable<String> get(String path) using RequestContext request {
+    return () -> ... .header("X-Trace-Id", request.traceId()) ...;
+}
+```
+
+`DashboardServerTest` checks all four downstream calls, including the three parallel ones,
+arrive with the caller's trace ID.
+
+Compared with Java's `ScopedValue`, which does a similar job at runtime:
+
+- **Checked at compile time.** If a call needs a `RequestContext` and none is in scope, the
+  build fails. A `ScopedValue` that isn't bound fails when the code runs.
+- **Works with lazy code.** The context is an ordinary argument, captured when the `Callable`
+  is built. A `ScopedValue` must still be bound when `call()` runs, which is easy to get
+  wrong with lazy tasks.
+- **Visible in signatures.** `using RequestContext request` says what a method needs.
+
 ## Things that may surprise you
 
 - **Every generator ends with `;`.** `x <- xs` without a semicolon is not recognised.

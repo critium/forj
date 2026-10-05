@@ -131,6 +131,60 @@ siblings and rethrows the failed task's exception. There is no tuple type, so th
 function usually builds a record. `StructuredTaskScope` is a preview API in JDK 27 and 28,
 so forj builds with `--enable-preview`.
 
+## `given` / `using`
+
+Scala 3 syntax, resolved at compile time like scalac does:
+
+| Scala 3 | forj |
+|---|---|
+| `given intOrd: Ordering[Int] = ...` | `given Ordering<Integer> intOrd = ...;` |
+| `given listOrd[A](using Ordering[A]): Ordering[List[A]] = ...` | `given <A> Ordering<List<A>> listOrd(using Ordering<A> elem) { ... }` |
+| `def max[A](xs: List[A])(using ord: Ordering[A]): A` | `static <A> A max(List<A> xs) using Ordering<A> ord { ... }` |
+| `summon[Ordering[Int]]` | `Implicits.<Ordering<Integer>>summon()` |
+| `import Instances.given` | `import static Instances.*;` |
+
+Resolution follows Scala 3: candidates must have the required type, and the nearest scope
+wins.
+
+| Priority | forj | Scala 3 equivalent |
+|---|---|---|
+| 1 | local `given` declared earlier in the block | local givens |
+| 2 | the enclosing method's `using` parameters | context parameters in scope |
+| 3 | givens in the enclosing classes | givens in enclosing templates |
+| 4 | `import static X.*` | `import X.given` |
+| 5 | givens in the type class's class and its type arguments' classes | implicit scope (companion objects) |
+
+Two matches at the same priority are an ambiguity error. Scala would also try to rank them by
+specificity first; forj doesn't. Givens can take `using` parameters, so instances derive
+recursively, and a local given flows into derived instances (`given Show<Integer> hex` makes
+`Show.show(List.of(10, 11))` use `Show.list(hex)`).
+
+`examples/.../typeclasses/Resolution.java` has one runnable case per rule, and
+`docs/java-developers.md` walks through them.
+
+Context parameters work the same way. The dashboard example declares
+`given RequestContext request = RequestContext.from(exchange);` in the HTTP handler and
+every downstream call takes `using RequestContext request`. In Scala you would write the same
+thing. Unlike `ScopedValue`, which is Java's runtime take on dynamic context, a missing
+context is a compile error, and lazy `Callable`s capture it when they are built.
+
+Under the hood: `given` compiles to a `public static` member annotated `@forj.Given`, `using`
+to a trailing parameter annotated `@forj.Using`. Both annotations are kept in class files, so
+libraries can ship instances. At each call that leaves `using` arguments out, the plugin type
+checks copies of the arguments, infers the method's type parameters, resolves the givens and
+inserts them; javac then type checks the call as written out in full.
+
+Differences from Scala 3:
+
+- Givens must be named. In a class they are static members; local givens work inside
+  method bodies.
+- No ranking of ambiguous givens by specificity.
+- No `given ... with { }` instance bodies: use a lambda or an anonymous class.
+- No implicit conversions, no `using` on constructors, no `extension` methods.
+- Type parameters that only appear in `using` parameters can't be inferred from the call;
+  pass them explicitly (`Owner.<Integer>empty()`).
+- `using` methods are found when declared in sources being compiled or in imported classes.
+
 ## Things Scala does that forj doesn't (yet)
 
 - No pattern binders or refutable patterns in generators.

@@ -112,6 +112,82 @@ and `x <- e;` show up as syntax errors, and completion and hover don't work insi
   Teach it to load javac plugins from the build's `javacOptions`, or contribute an option
   upstream. Diagnostics already come from the Mill build over BSP and are correct.
 
-## Later
-- Scala-style guards (`if cond` inside `forj { }`) instead of `guard(cond);`.
-- Semicolon-free generators (`x <- xs` ended by a newline) like Scala's braces syntax.
+## `given` / `using` follow-ups
+
+- When resolution fails, javac also reports "method cannot be applied" for the same call;
+  suppress that duplicate.
+- Calls to `using` methods are only considered when the method is declared in the sources
+  being compiled, in an imported class, or in a class of the same package; a method reached
+  through an instance of some other library type is skipped.
+- Ambiguous givens are an error even where Scala would pick the more specific one.
+- Each call site re-attributes its enclosing method up to the call (`Trees.getScope`), which
+  is quadratic in method size. Cache scopes per method if it shows up in build times.
+- Return-type inference for `using` methods: see "Toward real type classes" below.
+
+## Toward real type classes
+
+What `examples/.../typeclasses/` has today is type classes over plain types (`Show<Integer>`):
+chosen by type at compile time, generic constraints (`using Show<A>`), derived and
+retroactive instances. These are the gaps, most valuable first.
+
+1. **Return-type polymorphism.** Infer type parameters from the expected type, not only from
+   arguments, so `Integer zero = Monoid.empty();` finds `Monoid<Integer>` without writing
+   `Monoid.<Integer>empty()`. Needs the call's target type (assignment, return, argument
+   position) during resolution. Then add a `Monoid` example (`empty`, `combine`,
+   `combineAll`): it shows what type classes do that interfaces can't.
+2. **Higher-kinded type classes.** Java has no `F<_>`, so `Functor<F>`, `Monad<F>` and
+   `Traverse<F>` can't be written, and forj's monads are static-import overloads rather than
+   a type class (no generic code over "any monad"). Use the encoding from Arrow-Java and
+   HighJ: a witness type per container (`ListKind.Witness`), `Kind<F, A>` with
+   `narrow`/`widen`, then `given Monad<ListKind.Witness>` instances. Then decide:
+   - whether forj comprehensions should desugar to `Monad<F>` calls instead of overloads;
+   - whether the plugin can hide the `Kind` wrapping and unwrapping at call sites.
+3. **Extension syntax.** `money.show()` instead of `Show.show(money)`, like Scala 3
+   `extension` methods: would need the plugin to rewrite unresolved method calls on a
+   receiver to type class calls.
+4. **Coherence (decide, don't necessarily build).** Like Scala, forj allows more than one
+   instance per type (local givens), so a value can be shown differently at different call
+   sites. Haskell forbids that. Decide whether to offer a strict mode.
+5. **A better example.** `Show` is little more than `Function<A, String>`. Replace or extend
+   the package with `Monoid` (after 1) and `Functor`/`Monad` (after 2); until then, consider
+   renaming the package to `givens` so it doesn't promise more than it shows.
+
+## More Scala syntax
+
+Most of these only need the text-rewrite stage (`SourceRewriter`), sometimes plus the
+desugarer. Grouped by effort.
+
+### Easy (about an hour each)
+
+- **`val`:** `val total = price * qty;` becomes `final var total = ...;`.
+- **Scala-style guards:** `if x > 1;` inside `forj { }` instead of `guard(x > 1);`.
+- **Value definitions without `var`:** `y = x * 2;` inside `forj { }` becomes
+  `var y = x * 2;`. Unambiguous there: assigning an outer local inside the generated
+  lambdas is illegal anyway.
+- **String interpolation:** `s"Hi $name, you owe ${total / 100}"` becomes
+  `"Hi " + name + ", you owe " + (total / 100)`. javac's tokenizer sees `s"..."` as an
+  identifier followed by a string literal, so it's easy to find. Java's own string templates
+  were withdrawn after JDK 22, so this fills a real gap.
+
+### Easy to medium (half a day)
+
+- **`forj { ... } do { ... }`:** the side-effect form without `yield`. Needs a
+  `forjForeach` method in each monad instance.
+- **Semicolon-free generators:** `x <- xs` ended by a newline, like Scala's brace syntax.
+  The rewriter has line positions; the work is deciding when an expression continues on the
+  next line.
+
+### Medium (a day or more)
+
+- **Placeholder lambdas:** `xs.map(_ * 2)` becomes `x -> x * 2`. The simple case is easy;
+  Scala's rules for how far `_` reaches are subtle.
+- **Pattern generators:** `Point(x, y) <- points;` using Java record patterns, filtering out
+  elements that don't match (Scala's refutable patterns).
+
+### Hard
+
+- **Extension methods:** see "Toward real type classes" (item 3).
+- **Tuples:** `(a, b) <- pairs;`, `return (x, y)`. Needs tuple types in `core` and
+  destructuring.
+- **Named and default arguments:** `connect(host = "x", retries = 3)`. Needs the method
+  signature at the call site, so it belongs in the resolution stage with `given`/`using`.

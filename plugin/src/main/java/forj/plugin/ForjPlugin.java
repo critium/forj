@@ -9,7 +9,10 @@ import com.sun.tools.javac.api.BasicJavacTask;
 import com.sun.tools.javac.tree.JCTree.JCCompilationUnit;
 import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.Log;
+import com.sun.tools.javac.code.Symbol.ClassSymbol;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.HashMap;
 import java.util.Map;
 import javax.tools.JavaFileObject;
@@ -20,7 +23,9 @@ import javax.tools.JavaFileObject;
  *   <li>before parsing, {@link SourceRewriter} turns {@code forj { x <- e; } yield f(x)}
  *       into {@code forj (() -> { x =  e; yield f(x); })}, which javac can parse;</li>
  *   <li>after parsing, before name resolution, {@link Desugarer} rewrites each
- *       {@code forj} block into flatMap/map/filter calls.</li>
+ *       {@code forj} block into flatMap/map/filter calls;</li>
+ *   <li>before javac type checks each class, {@link ImplicitResolver} passes the
+ *       {@code given} instances that calls leave out of their {@code using} parameters.</li>
  * </ol>
  *
  * <p>Enable with {@code -Xplugin:Forj}, or {@code -Xplugin:"Forj debug"} to print each
@@ -42,6 +47,9 @@ public final class ForjPlugin implements Plugin {
         Map<JavaFileObject, SourceRewriter.Result> rewrites = new HashMap<>();
         ForjParserFactory.install(context, rewrites);
 
+        List<JCCompilationUnit> parsed = new ArrayList<>();
+        ImplicitResolver[] implicits = {null};
+
         task.addTaskListener(new TaskListener() {
             @Override
             public void finished(TaskEvent e) {
@@ -52,7 +60,25 @@ public final class ForjPlugin implements Plugin {
                         ForjParserFactory.restoreOriginalPositions(unit, rewrite, log);
                         new Desugarer(context, trees, unit, rewrite.inOriginalPositions(), debug).run();
                     }
+                    parsed.add(unit);
                 }
+            }
+
+            @Override
+            public void started(TaskEvent e) {
+                if (e.getKind() != TaskEvent.Kind.ANALYZE || e.getTypeElement() == null) {
+                    return;
+                }
+                if (implicits[0] == null) {
+                    var given = (ClassSymbol) task.getElements().getTypeElement("forj.Given");
+                    var using = (ClassSymbol) task.getElements().getTypeElement("forj.Using");
+                    if (given == null || using == null) {
+                        return; // forj's core isn't on the classpath: nothing can be given
+                    }
+                    implicits[0] = new ImplicitResolver(context, trees, task.getElements(), given, using);
+                    parsed.forEach(implicits[0]::index);
+                }
+                implicits[0].resolve((JCCompilationUnit) e.getCompilationUnit(), e.getTypeElement());
             }
         });
     }

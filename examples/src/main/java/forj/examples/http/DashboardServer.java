@@ -11,7 +11,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -32,6 +34,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * StructuredTaskScope; if one fails, the others are cancelled. The downstream services are
  * served by this same process with an artificial {@link #LATENCY}.
  *
+ * <p>Every downstream call carries the request's trace ID. The handler declares the
+ * {@link RequestContext} once as a {@code given}; {@link #dashboard} and {@link #get} take it
+ * as a {@code using} parameter, and the forj plugin passes it along at compile time.
+ *
  * <p>Run: {@code ./mill examples.runMain forj.examples.http.DashboardServer}, then
  * {@code curl localhost:8080/dashboard/ana}.
  */
@@ -42,6 +48,7 @@ public final class DashboardServer implements AutoCloseable {
     private final HttpServer server;
     private final HttpClient client = HttpClient.newHttpClient();
     private final AtomicInteger downstreamCalls = new AtomicInteger();
+    private final List<String> downstreamTraceIds = new CopyOnWriteArrayList<>();
 
     private DashboardServer(HttpServer server) {
         this.server = server;
@@ -72,8 +79,10 @@ public final class DashboardServer implements AutoCloseable {
 
     // GET /dashboard/{user}
     private void dashboard(HttpExchange exchange) {
+        given RequestContext request = RequestContext.from(exchange);
+        exchange.getResponseHeaders().set(RequestContext.TRACE_HEADER, request.traceId());
         try {
-            respond(exchange, 200, dashboard(lastSegment(exchange)).call());
+            respond(exchange, 200, dashboard(lastSegment(exchange)).call());   // `request` passed for us
         } catch (Exception e) {
             respond(exchange, 502, "{\"error\":\"" + e.getMessage() + "\"}");
         }
@@ -82,7 +91,7 @@ public final class DashboardServer implements AutoCloseable {
     record Parts(String profile, String orders, String recommendations) {}
 
     /** Describes the dashboard for {@code user}; no request is made until {@code call()}. */
-    Callable<String> dashboard(String user) {
+    Callable<String> dashboard(String user) using RequestContext request {
         return forj {
             parts <- Par.mapN(
                     get("/profile/" + user),
@@ -103,10 +112,12 @@ public final class DashboardServer implements AutoCloseable {
         return inner.isEmpty() ? 0 : inner.split(",").length;
     }
 
-    private Callable<String> get(String path) {
+    private Callable<String> get(String path) using RequestContext request {
         return () -> {
-            HttpRequest request = HttpRequest.newBuilder(uri().resolve(path)).build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpRequest http = HttpRequest.newBuilder(uri().resolve(path))
+                    .header(RequestContext.TRACE_HEADER, request.traceId())
+                    .build();
+            HttpResponse<String> response = client.send(http, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) {
                 throw new IllegalStateException(path + " returned " + response.statusCode());
             }
@@ -118,9 +129,15 @@ public final class DashboardServer implements AutoCloseable {
         return downstreamCalls.get();
     }
 
+    /** The trace ID each downstream call arrived with, in arrival order. */
+    List<String> downstreamTraceIds() {
+        return List.copyOf(downstreamTraceIds);
+    }
+
     /** A pretend remote service: answers after {@link #LATENCY}. */
     private void downstream(HttpExchange exchange, java.util.function.Function<String, String> body) {
         downstreamCalls.incrementAndGet();
+        downstreamTraceIds.add(String.valueOf(exchange.getRequestHeaders().getFirst(RequestContext.TRACE_HEADER)));
         try {
             Thread.sleep(LATENCY);
         } catch (InterruptedException e) {

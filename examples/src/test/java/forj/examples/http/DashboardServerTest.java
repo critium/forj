@@ -7,6 +7,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class DashboardServerTest {
@@ -18,12 +19,17 @@ class DashboardServerTest {
     @Test
     void servesTheCombinedDashboard() throws Exception {
         try (DashboardServer server = DashboardServer.start(0)) {
-            var request = HttpRequest.newBuilder(server.uri().resolve("/dashboard/ana")).build();
-            var response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+            var http = HttpRequest.newBuilder(server.uri().resolve("/dashboard/ana"))
+                    .header("X-Trace-Id", "trace-42")
+                    .build();
+            var response = HttpClient.newHttpClient().send(http, HttpResponse.BodyHandlers.ofString());
 
             assertEquals(200, response.statusCode());
             assertEquals(EXPECTED, response.body());
             assertEquals(4, server.downstreamCalls());
+            // the context reached every downstream call, parallel ones included
+            assertEquals(List.of("trace-42", "trace-42", "trace-42", "trace-42"), server.downstreamTraceIds());
+            assertEquals("trace-42", response.headers().firstValue("X-Trace-Id").orElseThrow());
         }
     }
 
@@ -36,6 +42,7 @@ class DashboardServerTest {
     @Test
     void nothingRunsUntilCalledAndEachCallRunsAgain() throws Exception {
         try (DashboardServer server = DashboardServer.start(0)) {
+            given RequestContext request = new RequestContext("test-run");
             var dashboard = server.dashboard("ana");
             assertEquals(0, server.downstreamCalls());
 
