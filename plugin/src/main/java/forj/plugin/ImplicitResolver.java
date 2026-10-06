@@ -109,6 +109,8 @@ final class ImplicitResolver {
     private final ClassSymbol kindSymbol;
     private final ClassSymbol forClass;
     private final ClassSymbol defaultInstances;
+    private final ClassSymbol extensionAnnotation;
+    private final ClassSymbol defaultSyntax;
     private final Name forjLower;
     private final Name forjLift;
 
@@ -118,6 +120,8 @@ final class ImplicitResolver {
     private final Set<Name> usingMethodNames = new java.util.HashSet<>();
     /** Names of methods known to return a {@code Kind}: their results get narrowed where assigned or returned. */
     private final Set<Name> kindMethodNames = new java.util.HashSet<>();
+    /** Names of extension methods; {@code x.name(...)} is only looked at for these. */
+    private final Set<Name> extensionNames = new java.util.HashSet<>();
     private final Set<Name> indexedPackages = new java.util.HashSet<>();
 
     ImplicitResolver(Context context, Trees trees, javax.lang.model.util.Elements elements,
@@ -143,9 +147,11 @@ final class ImplicitResolver {
         this.kindSymbol = (ClassSymbol) elements.getTypeElement("forj.Kind");
         this.forClass = (ClassSymbol) elements.getTypeElement("forj.For");
         this.defaultInstances = (ClassSymbol) elements.getTypeElement("forj.Instances");
+        this.extensionAnnotation = (ClassSymbol) elements.getTypeElement("forj.Extension");
+        this.defaultSyntax = (ClassSymbol) elements.getTypeElement("forj.Syntax");
         this.forjLower = names.fromString("forjLower");
         this.forjLift = names.fromString("forjLift");
-        for (String name : List.of("forj.For", "forj.Implicits")) {
+        for (String name : List.of("forj.For", "forj.Implicits", "forj.Syntax")) {
             if (elements.getTypeElement(name) instanceof ClassSymbol c) {
                 indexMembers(c);
             }
@@ -159,6 +165,9 @@ final class ImplicitResolver {
             public void visitMethodDef(JCMethodDecl tree) {
                 if (tree.restype != null && tree.restype.toString().matches("(forj\\.)?Kind<.*")) {
                     kindMethodNames.add(tree.name);
+                }
+                if (tree.mods.annotations.stream().anyMatch(a -> a.annotationType.toString().endsWith("Extension"))) {
+                    extensionNames.add(tree.name);
                 }
                 for (JCVariableDecl p : tree.params) {
                     if (p.mods.annotations.stream().anyMatch(a -> a.annotationType.toString().endsWith("Using"))) {
@@ -211,8 +220,13 @@ final class ImplicitResolver {
                     outcome = new CallSite(unit, getCurrentPath(), call).liftKind();
                 } else if (isUnpinnedStep(call, name)) {
                     outcome = new CallSite(unit, getCurrentPath(), call).pinTypeArguments();
-                } else if (usingMethodNames.contains(name)) {
-                    outcome = new CallSite(unit, getCurrentPath(), call).complete(report);
+                } else {
+                    if (extensionNames.contains(name) && call.meth instanceof JCFieldAccess) {
+                        outcome = new CallSite(unit, getCurrentPath(), call).extension(report);
+                    }
+                    if (outcome == Outcome.SKIPPED && usingMethodNames.contains(name)) {
+                        outcome = new CallSite(unit, getCurrentPath(), call).complete(report);
+                    }
                 }
                 if (outcome != Outcome.PENDING && kindMethodNames.contains(name) && narrowable(getCurrentPath())
                         && new CallSite(unit, getCurrentPath(), call).narrow()) {
@@ -265,6 +279,9 @@ final class ImplicitResolver {
                 }
                 if (returnsKind(method)) {
                     kindMethodNames.add(method.name);
+                }
+                if (isExtension(method)) {
+                    extensionNames.add(method.name);
                 }
             }
         }
@@ -377,7 +394,7 @@ final class ImplicitResolver {
                 given.append(found);
             }
             call.args = call.args.appendList(given.toList());
-            if (method.owner == forClass) {
+            if (method.owner == forClass || isExtension(method)) {
                 typeLambdaParameters(method, bindings);
             }
             return Outcome.RESOLVED;
@@ -408,6 +425,123 @@ final class ImplicitResolver {
                     p.declKind = JCVariableDecl.DeclKind.EXPLICIT;
                 }
                 lambda.paramKind = JCLambda.ParameterKind.EXPLICIT;
+            }
+        }
+
+        /**
+         * {@code x.name(args)} where {@code x}'s type has no method {@code name} but an extension
+         * method of that name takes {@code x}: becomes {@code Owner.name(x, args)}, whose
+         * {@code using} arguments the next pass fills in. Search order, nearest first: the
+         * enclosing classes, {@code import static}, the type classes of the givens in scope
+         * (local givens and the enclosing method's using parameters), the classes of the
+         * receiver's type and its type arguments, then {@code forj.Syntax}.
+         */
+        Outcome extension(boolean report) {
+            this.report = report;
+            var select = (JCFieldAccess) call.meth;
+            Name name = select.name;
+            if (call.typeargs.nonEmpty()) {
+                return Outcome.SKIPPED;
+            }
+            Type receiver = speculate(select.selected, false);
+            if (receiver == null || receiver.isErroneous()) {
+                Type asType = speculate(select.selected, true);
+                if (asType != null && !asType.isErroneous()) {
+                    return Outcome.SKIPPED;     // `Type.name(...)`: a static call
+                }
+                // not typed yet (say, the result of another extension call): try again next pass
+                return report ? Outcome.SKIPPED : Outcome.PENDING;
+            }
+            if (receiver.isPrimitive()) {
+                receiver = types.boxedClass(receiver).type;
+            }
+            Set<Symbol> own = new LinkedHashSet<>();
+            addMembers(types.skipTypeVars(receiver, false), name, own);
+            own.removeIf(m -> m instanceof MethodSymbol ms && isExtension(ms)); // e.g. declared in the receiver's record
+            if (!own.isEmpty()) {
+                return Outcome.SKIPPED;         // the type's own method wins, as in Scala
+            }
+            for (List<MethodSymbol> level : extensionLevels(name, receiver)) {
+                Type r = receiver;
+                List<MethodSymbol> fits = level.stream().filter(m -> takesReceiver(m, r)).toList();
+                if (fits.size() > 1) {
+                    return error(call, "ambiguous extension methods for " + name + ": "
+                            + fits.stream().map(ImplicitResolver::describe).toList());
+                }
+                if (fits.size() == 1) {
+                    MethodSymbol m = fits.getFirst();
+                    indexMembers((ClassSymbol) m.owner);   // its using parameters, if from a library
+                    make.at(select.pos);
+                    call.meth = make.Select(qualified((ClassSymbol) m.owner), name);
+                    call.args = call.args.prepend(select.selected);
+                    return Outcome.RESOLVED;
+                }
+            }
+            return Outcome.SKIPPED;             // javac reports the missing method
+        }
+
+        /** An extension method that can be called with the receiver and this call's arguments. */
+        private boolean takesReceiver(MethodSymbol m, Type receiver) {
+            int params = m.params().size();
+            int explicit = call.args.size() + 1;
+            if (params != explicit && params - usingCount(m) != explicit) {
+                return false;
+            }
+            return types.isConvertible(receiver, types.erasure(m.type.getParameterTypes().head));
+        }
+
+        private List<List<MethodSymbol>> extensionLevels(Name name, Type receiver) {
+            List<Set<Symbol>> levels = new ArrayList<>();
+            Set<Symbol> enclosing = new LinkedHashSet<>();
+            for (Env<AttrContext> e = env; e != null; e = e.outer) {
+                if (e.enclClass != null && e.enclClass.sym != null) {
+                    addMembers(e.enclClass.sym.type, name, enclosing);
+                }
+            }
+            levels.add(enclosing);
+            Set<Symbol> imported = new LinkedHashSet<>();
+            unit.namedImportScope.getSymbolsByName(name).forEach(imported::add);
+            unit.starImportScope.getSymbolsByName(name).forEach(imported::add);
+            levels.add(imported);
+            // like Scala's extensions on a given in scope: the type classes of the enclosing
+            // method's using parameters and of local givens (`a.show()` given a Show<A>)
+            Set<Symbol> inScope = new LinkedHashSet<>();
+            List<Symbol> givensInScope = new ArrayList<>(localGivens());
+            if (env.enclMethod != null && env.enclMethod.sym != null) {
+                env.enclMethod.sym.params().stream().filter(ImplicitResolver.this::isUsing).forEach(givensInScope::add);
+            }
+            for (Symbol g : givensInScope) {
+                addMembers(g.type, name, inScope);
+            }
+            levels.add(inScope);
+            Set<Symbol> companions = new LinkedHashSet<>();
+            addReceiverClasses(receiver, name, companions, new java.util.HashSet<>());
+            levels.add(companions);
+            Set<Symbol> defaults = new LinkedHashSet<>();
+            if (defaultSyntax != null) {
+                addMembers(defaultSyntax.type, name, defaults);
+            }
+            levels.add(defaults);
+            List<List<MethodSymbol>> result = new ArrayList<>();
+            for (Set<Symbol> level : levels) {
+                result.add(level.stream()
+                        .filter(s -> s instanceof MethodSymbol m && isExtension(m) && (m.flags() & Flags.STATIC) != 0
+                                && rs.isAccessible(env, m.owner.type, m))
+                        .map(s -> (MethodSymbol) s)
+                        .toList());
+            }
+            return result;
+        }
+
+        /** Extensions declared in the receiver type's classes and its type arguments' classes. */
+        private void addReceiverClasses(Type t, Name name, Set<Symbol> into, Set<Symbol> seen) {
+            t = types.skipTypeVars(t, false);
+            if (t == null || t.tsym == null || !seen.add(t.tsym)) {
+                return;
+            }
+            addMembers(t, name, into);
+            for (Type arg : t.getTypeArguments()) {
+                addReceiverClasses(arg instanceof WildcardType w ? w.type : arg, name, into, seen);
             }
         }
 
@@ -1058,6 +1192,10 @@ final class ImplicitResolver {
 
     private boolean isUsing(VarSymbol p) {
         return p.attribute(usingAnnotation) != null;
+    }
+
+    private boolean isExtension(MethodSymbol m) {
+        return extensionAnnotation != null && m.attribute(extensionAnnotation) != null;
     }
 
     private int usingCount(MethodSymbol m) {

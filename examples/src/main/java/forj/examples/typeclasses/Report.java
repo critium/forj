@@ -9,7 +9,7 @@ public final class Report {
 
     /** Generic code asks for an instance in turn, and passes it on implicitly. */
     static <A> String line(String label, A value)(using Show<A> show) {
-        return label + ": " + Show.show(value);
+        return label + ": " + value.show();                // an extension method on any A with a Show
     }
 
     public static List<String> lines() {

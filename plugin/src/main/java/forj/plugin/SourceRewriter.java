@@ -93,7 +93,9 @@ final class SourceRewriter {
     private static final String YIELD = "yield";
     private static final String GIVEN = "given";
     private static final String USING = "using";
+    private static final String EXTENSION = "extension";
     private static final String GIVEN_ANNOTATION = "@forj.Given ";
+    private static final String EXTENSION_ANNOTATION = "@forj.Extension ";
     private static final String USING_ANNOTATION = "@forj.Using ";
 
     private SourceRewriter() {}
@@ -102,7 +104,7 @@ final class SourceRewriter {
         String text = input.toString();
         boolean interpolates = Interpolations.mayContain(text);
         if (!interpolates && !text.contains("<-") && !text.contains(FORJ) && !text.contains(GIVEN)
-                && !text.contains(USING) && !text.contains("<_>")) {
+                && !text.contains(USING) && !text.contains(EXTENSION) && !text.contains("<_>")) {
             return null;
         }
         List<Token> tokens = tokenize(text, scanners, log);
@@ -255,13 +257,14 @@ final class SourceRewriter {
         return end < tokens.size() && tokens.get(end).kind == TokenKind.SEMI;
     }
 
-    // ------------------------------------------------- given T x = e;  given <A> T f(...) { }
+    // ------------------- given T x = e;  given <A> T f(...) { }  extension <A> T f(A a) { }
 
     /**
      * {@code given} starting a declaration becomes {@code @forj.Given} plus the modifiers it
      * implies: {@code static final} for a field, {@code static} for a method, {@code final} for
      * a local variable. Like Scala, a given in a class is public unless an access modifier
-     * says otherwise.
+     * says otherwise. {@code extension} on a method in a class becomes {@code @forj.Extension}
+     * plus {@code public static} the same way.
      */
     private static void findGivens(List<Token> tokens, List<Edit> edits) {
         boolean[] classBody = classBodies(tokens);
@@ -286,6 +289,15 @@ final class SourceRewriter {
                 String modifiers = !inClass ? "final"
                         : (hasAccess ? "" : "public ") + (declares == TokenKind.EQ ? "static final" : "static");
                 edits.add(new Edit(t.pos, t.endPos, GIVEN_ANNOTATION + modifiers, 0, Kind.TEXT));
+            } else if (isName(t, EXTENSION) && startsMember(tokens, i) && i + 1 < tokens.size()
+                    && Boolean.TRUE.equals(braces.peek())
+                    && (tokens.get(i + 1).kind == TokenKind.IDENTIFIER || tokens.get(i + 1).kind == TokenKind.LT)
+                    && firstAtDepthZero(tokens, i + 1, TokenKind.EQ, TokenKind.LPAREN, TokenKind.SEMI) == TokenKind.LPAREN) {
+                boolean hasAccess = i > 0 && switch (tokens.get(i - 1).kind) {
+                    case PUBLIC, PRIVATE, PROTECTED -> true;
+                    default -> false;
+                };
+                edits.add(new Edit(t.pos, t.endPos, EXTENSION_ANNOTATION + (hasAccess ? "" : "public ") + "static", 0, Kind.TEXT));
             }
         }
     }

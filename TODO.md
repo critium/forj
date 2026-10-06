@@ -1,5 +1,27 @@
 # TODO
 
+## Publish forj for the forj-http libraries
+
+**Status:** open, added 2026-10-06. Blocks step 0 of the forj-http plan
+(`../forj-mega-project/planning/lets-make-something-meaningfully-warm-lark.md`).
+
+forj-http is being built as separate libraries in `../forj-mega-project/`. Each of `codec/`,
+`server/`, `plugins/` and `benchmarks/` is its own git repo and Mill build, so they can only
+depend on forj through published artifacts.
+
+- Commit (or otherwise settle) the uncommitted extension-methods work first.
+- Mix `PublishModule` into `core` and `plugin`: group `forj`, version `0.1.0-SNAPSHOT`,
+  artifacts `forj-core` and `forj-plugin`.
+- `./mill __.publishLocal` into `~/.m2`, then check that a downstream build compiles with
+  `-Xplugin:Forj` from the published jar.
+- Downstream `ForjModule` (copied into each library's `build.mill` for now): put
+  `forj-plugin` on `compileMvnDeps`. Its jar carries `META-INF/services`, so the
+  `compileResources` workaround isn't needed there.
+- Later: publish `PinnedJdk`/`ForjJava`/`ForjTests`/`ForjModule` as a Mill plugin so the
+  libraries stop copying them (and `bin/fetch-jdk`, `bin/make-preview-jdk`).
+- Still in forj, needed by the libraries afterwards: `Effect`/`ConcurrentEffect` (step 1),
+  `Schema<T>` + `@Derives` + the `derives` rewrite (step 6).
+
 ## semanticdb (Metals index) crashes on files that use `forj`
 
 **Status:** open, time-boxed and parked on 2026-10-03.
@@ -150,9 +172,15 @@ retroactive instances. These are the gaps, most valuable first.
    - automatic lifting and lowering of JDK types at call sites of `F<_>` methods
      (`addBoth(List.of(1), List.of(2))` instead of `new ListK<>(...)`, and a `List` back);
    - a "most specific instance wins" rule if a type ever gets two instances on one ladder.
-3. **Extension syntax.** `money.show()` instead of `Show.show(money)`, and `fa.map(f)` on any
-   `F<A>` with a `Functor<F>` in scope, like Scala 3 `extension` methods: would need the
-   plugin to rewrite unresolved method calls on a receiver to type class calls.
+3. **Extension syntax.** Done: `extension` methods and `forj.Syntax` (`fa.map(f)`,
+   `a.combine(b)`, ...). Follow-ups:
+   - explicit type arguments on extension calls (`fa.<B>map(f)`);
+   - extensions on JDK types that aren't a `Kind` (`list.map(f)` on a `java.util.List`
+     needs a lift; see auto-lifting above);
+   - operators: Java has no user operators, so `|+|`, `>>`, `*>` stay named methods;
+   - extensions declared in a compiled library are found through `import static`, the
+     receiver's classes and `forj.Syntax`; a library class reachable only some other way
+     isn't searched.
 4. **Coherence (decide, don't necessarily build).** Like Scala, forj allows more than one
    instance per type (local givens), so a value can be shown differently at different call
    sites. Haskell forbids that. Decide whether to offer a strict mode.
@@ -221,7 +249,6 @@ desugarer. Grouped by effort.
 
 ### Hard
 
-- **Extension methods:** see "Toward real type classes" (item 3).
 - **Tuples:** `(a, b) <- pairs;`, `return (x, y)`. Needs tuple types in `core` and
   destructuring.
 - **Named and default arguments:** `connect(host = "x", retries = 3)`. Needs the method

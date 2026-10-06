@@ -19,7 +19,8 @@ public interface Show<A> {
         return o -> o.map(a -> "Some(" + value.show(a) + ")").orElse("None");
     }
 
-    static <A> String show(A a)(using Show<A> s) {
+    /** {@code x.show()} for any {@code x} with a {@code Show}; also callable as {@code Show.show(x)}. */
+    extension <A> String show(A a)(using Show<A> s) {
         return s.show(a);
     }
 }

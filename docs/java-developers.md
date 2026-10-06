@@ -437,6 +437,50 @@ final class Report {
 To get an instance directly: `Implicits.<Show<Integer>>summon()`. Instances in compiled
 libraries are found too.
 
+## Extension methods
+
+`extension` declares a static method you can call as if it were a method of its first
+parameter's type:
+
+```java
+public interface Show<A> {
+    String show(A a);
+    extension <A> String show(A a)(using Show<A> s) { return s.show(a); }
+}
+
+import static forj.examples.typeclasses.Show.*;
+money.show()          // the plugin calls Show.show(money, Money.show)
+```
+
+When `x.name(...)` doesn't match a method `x`'s type has, the plugin looks for an extension
+method named `name` whose first parameter takes `x`, nearest first:
+
+| Order | Where | Example |
+|---|---|---|
+| 1 | the enclosing classes | a helper in the same class |
+| 2 | `import static` | `import static lib.Show.*;` |
+| 3 | the type classes of givens in scope (local givens, the method's `using` parameters) | `a.show()` inside `f(A a)(using Show<A> s)` |
+| 4 | the receiver's class and its type arguments' classes | `extension String pretty(Money m)` inside `Money` |
+| 5 | `forj.Syntax` | `fa.map(f)` on any `F<A>` |
+
+A method the type really has always wins: `optional.map(f)` is `Optional.map`. Extension
+methods take `using` parameters like any other method, so instances are resolved as usual.
+
+`forj.Syntax` turns the type classes into methods on any `F<A>`: `map`, `as`, `voided`,
+`map2`, `flatMap`, `productR`, `flatten`, `filter`, `handleErrorWith`, `handleError`,
+`attempt`, `guarantee`, `start`, `race`, `parMap2`, `foldLeft`, `combineAll`, `sequence`, and
+`combine` on any value with a `Semigroup`. Generic code reads like code on a concrete type:
+
+```java
+static <F<_>, A> F<A> retry(F<A> attempt, int times)(using MonadError<F, Throwable> errors) {
+    return times <= 1 ? attempt : attempt.handleErrorWith(e -> retry(attempt, times - 1));
+}
+```
+
+Asking for a capability the effect doesn't have is still a compile error:
+`callable.filter(p)` gives `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
+The plain-Java spelling is `@Extension public static`.
+
 ## Context parameters: passing things through without passing them
 
 `using` isn't only for type classes. It also carries context that a lot of code needs and

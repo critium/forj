@@ -32,11 +32,14 @@ public interface Show<A> {
     String show(A a);
     given Show<Integer> integer = i -> Integer.toString(i);
     given <A> Show<List<A>> list(using Show<A> element) { ... }
-    static <A> String show(A a)(using Show<A> s) { return s.show(a); }
+    extension <A> String show(A a)(using Show<A> s) { return s.show(a); }
 }
 
-Show.show(List.of(1, 2));   // the plugin passes Show.list(Show.integer); no instance, no build
+List.of(1, 2).show();   // with import static Show.*: Show.show(List.of(1, 2), Show.list(Show.integer)); no instance, no build
 ```
+
+Extension methods also give the type classes cats-style syntax on any `F`, with no imports:
+`fa.map(f)`, `fa.flatMap(f)`, `fa.handleErrorWith(h)`, `fa.race(fb)`, `a.combine(b)`.
 
 Callers can still pass an instance themselves (`Show.show(xs)(using hexShow)`). For code that
 must parse in any Java editor, `@Using`/`@Given` annotations do the same as the keywords.

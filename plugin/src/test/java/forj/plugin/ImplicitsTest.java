@@ -21,7 +21,7 @@ import org.junit.jupiter.api.Test;
 /** given / using: compiles small programs with the plugin, then runs them. */
 class ImplicitsTest {
 
-    private record Compiled(Path classes, List<String> errors, Path... libraries) {
+    record Compiled(Path classes, List<String> errors, Path... libraries) {
         Object call(String className, String method) throws Exception {
             assertEquals(List.of(), errors);
             var cp = new ArrayList<java.net.URL>();
@@ -38,7 +38,7 @@ class ImplicitsTest {
         }
     }
 
-    private static Compiled compile(Map<String, String> sources, Path... classpath) throws Exception {
+    static Compiled compile(Map<String, String> sources, Path... classpath) throws Exception {
         List<JavaFileObject> files = new ArrayList<>();
         sources.forEach((name, code) -> files.add(new SimpleJavaFileObject(
                 URI.create("string:///" + name), JavaFileObject.Kind.SOURCE) {

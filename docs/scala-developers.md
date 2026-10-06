@@ -95,6 +95,7 @@ by an `Optional` one doesn't compile.
 | `Bracket[F, E]`, `Sync[F]`, `Async[F]`, `Concurrent[F]` | same (`Sync` is `Bracket<F, Throwable>`) |
 | `Fiber[F, A]` with `join` / `cancel` | same |
 | `Traverse`, `Foldable`, `FunctorFilter` | same (`Traverse` extends `Foldable`) |
+| `import cats.syntax.all._` (`fa.map`, `fa.attempt`, `a \|+\| b`, ...) | `forj.Syntax`, always in scope: `fa.map(f)`, `fa.attempt()`, `a.combine(b)`, ... |
 | `Semigroup`, `Monoid`, `|+|`, `combineAll` | `Semigroup`, `Monoid`, `combine`, `combineAll`; `Monoid.of(empty, combine)` builds one |
 | `IO`, `IO.delay`, `IO.suspend`, `IO.async`, `unsafeRunSync()` | `forj.effect.IO`, same |
 | `IO.race`, `parMapN` | `IO.race`, `IO.parMap2`, `Par.mapN` for `Callable` |
@@ -102,8 +103,7 @@ by an `Optional` one doesn't compile.
 | tagless final algebras `trait Repo[F[_]]` | `interface Repo<F<_>>` |
 
 Differences: no `Resource`, `Timer`, `ContextShift`, `Effect`/`ConcurrentEffect` or
-`LiftIO`; no syntax extensions (`fa.map(f)` on any `F`; you call the instance:
-`functor.map(fa, f)`); cancellation is thread interruption, checked between `IO` steps and
+`LiftIO`; cancellation is thread interruption, checked between `IO` steps and
 at blocking calls, rather than CE's cancellation tokens; `IO` blocks a virtual thread instead
 of running on a fiber scheduler, so there is no `tailRecM` (the interpreter is stack safe on
 its own).
@@ -234,7 +234,12 @@ Differences from Scala 3:
   method bodies.
 - No ranking of ambiguous givens by specificity.
 - No `given ... with { }` instance bodies: use a lambda or an anonymous class.
-- No implicit conversions, no `using` on constructors, no `extension` methods.
+- No implicit conversions, no `using` on constructors.
+- Extensions are declared one method at a time, as a modifier (`extension <A> String show(A a)(using Show<A> s)`)
+  with the receiver as the first parameter, rather than in an `extension (a: A)` block.
+  Lookup follows Scala's: the enclosing scope, imports, the type classes of givens in scope,
+  the receiver type's classes, then `forj.Syntax`. A method the type has always wins.
+- Explicit type arguments on an extension call (`fa.<B>map(f)`) aren't supported.
 - Type parameters that only appear in `using` parameters can't be inferred from the call;
   pass them explicitly (`Owner.<Integer>empty()`).
 - `using` methods are found when declared in sources being compiled or in imported classes.

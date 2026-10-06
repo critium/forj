@@ -23,12 +23,12 @@ public final class Ladder {
 
     /** Needs only to transform the result: Functor. */
     public static <F<_>> F<String> describe(F<Receipt> receipt)(using Functor<F> functor) {
-        return functor.map(receipt, Receipt::summary);
+        return receipt.map(Receipt::summary);
     }
 
     /** Needs to run again after a failure: MonadError. */
     public static <F<_>, A> F<A> retry(F<A> attempt, int times)(using MonadError<F, Throwable> errors) {
-        return times <= 1 ? attempt : errors.handleErrorWith(attempt, e -> retry(attempt, times - 1));
+        return times <= 1 ? attempt : attempt.handleErrorWith(e -> retry(attempt, times - 1));
     }
 
     /** Needs to run two things at once and cancel the loser: Concurrent. */
@@ -38,7 +38,7 @@ public final class Ladder {
             return "timeout";
         });
         return forj {
-            winner <- concurrent.race(fa, timer);
+            winner <- fa.race(timer);
             result <- winner.fold(concurrent::pure, timedOut -> concurrent.<A>raiseError(new TimeoutException(s"after $limit")));
         } yield result;
     }
