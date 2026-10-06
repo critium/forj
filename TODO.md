@@ -2,21 +2,16 @@
 
 ## Publish forj for the forj-http libraries
 
-**Status:** open, added 2026-10-06. Blocks step 0 of the forj-http plan
-(`../forj-mega-project/planning/lets-make-something-meaningfully-warm-lark.md`).
+**Status:** done 2026-10-06 for local use. `./mill __.publishM2Local` publishes
+`forj:forj-core` and `forj:forj-plugin` `0.1.0-SNAPSHOT` to `~/.m2`, and `bin/check-publish`
+builds and runs a downstream project against them (the `ForjModule` recipe is in the README,
+"Using forj from another build"). forj-http lives in `../forj-mega-project/`, planned in
+`../forj-mega-project/planning/lets-make-something-meaningfully-warm-lark.md`.
 
-forj-http is being built as separate libraries in `../forj-mega-project/`. Each of `codec/`,
-`server/`, `plugins/` and `benchmarks/` is its own git repo and Mill build, so they can only
-depend on forj through published artifacts.
+Follow-ups:
 
-- Commit (or otherwise settle) the uncommitted extension-methods work first.
-- Mix `PublishModule` into `core` and `plugin`: group `forj`, version `0.1.0-SNAPSHOT`,
-  artifacts `forj-core` and `forj-plugin`.
-- `./mill __.publishLocal` into `~/.m2`, then check that a downstream build compiles with
-  `-Xplugin:Forj` from the published jar.
-- Downstream `ForjModule` (copied into each library's `build.mill` for now): put
-  `forj-plugin` on `compileMvnDeps`. Its jar carries `META-INF/services`, so the
-  `compileResources` workaround isn't needed there.
+- Downstream builds hard-code the path to forj's `.jdk/preview`; the Mill plugin below
+  should own fetching the JDK instead.
 - Later: publish `PinnedJdk`/`ForjJava`/`ForjTests`/`ForjModule` as a Mill plugin so the
   libraries stop copying them (and `bin/fetch-jdk`, `bin/make-preview-jdk`).
 - Still in forj, needed by the libraries afterwards: `Effect`/`ConcurrentEffect` (step 1),

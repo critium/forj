@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Checks the published artifacts the way a downstream build uses them: a throw-away Mill
+# project that depends on forj-core and puts forj-plugin on the compile classpath, both from
+# ~/.m2, compiles a program using forj syntax with -Xplugin:Forj, and runs it.
+#
+# Run ./mill __.publishM2Local first. The build below is the downstream recipe libraries copy.
+set -euo pipefail
+FORJ="$(cd "$(dirname "$0")/.." && pwd -P)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+cp "$FORJ/mill" "$FORJ/.mill-version" "$WORK/"
+mkdir -p "$WORK/app/src/app"
+
+cat > "$WORK/build.mill" <<EOF
+package build
+
+import mill.*
+import mill.javalib.*
+
+/** javac internals the forj plugin uses: the compiler JVM needs them exported and opened. */
+val forjCompilerJvmOptions =
+  Seq("api", "code", "comp", "main", "parser", "tree", "util")
+    .map(p => s"--add-exports=jdk.compiler/com.sun.tools.javac.\$p=ALL-UNNAMED") ++
+  Seq("comp", "main", "util")
+    .map(p => s"--add-opens=jdk.compiler/com.sun.tools.javac.\$p=ALL-UNNAMED")
+
+/** What a module whose sources use forj syntax mixes in. */
+trait ForjModule extends JavaModule {
+  // forj's class files are preview class files for this exact JDK
+  def javaHome = Task.Input { Some(PathRef(os.Path("$FORJ/.jdk/preview"), quick = true)) }
+  def repositories = super.repositories() ++ Seq("m2Local")
+  def mvnDeps = super.mvnDeps() ++ Seq(mvn"forj:forj-core:0.1.0-SNAPSHOT")
+  def compileMvnDeps = super.compileMvnDeps() ++ Seq(mvn"forj:forj-plugin:0.1.0-SNAPSHOT")
+  def jvmOptions = super.jvmOptions() ++ forjCompilerJvmOptions
+  def javacOptions = super.javacOptions() ++ Seq("--enable-preview", "--source", "28", "-Xplugin:Forj")
+}
+
+object app extends ForjModule
+EOF
+
+cat > "$WORK/app/src/app/Show.java" <<'EOF'
+package app;
+
+public interface Show<A> {
+    String show(A a);
+
+    given Show<Integer> integer = i -> "#" + i;
+
+    extension <A> String show(A a)(using Show<A> s) {
+        return s.show(a);
+    }
+}
+EOF
+
+cat > "$WORK/app/src/app/Main.java" <<'EOF'
+package app;
+
+import static app.Show.*;
+
+import java.util.Optional;
+
+public class Main {
+    static <A> String twice(A a)(using Show<A> s) {
+        return a.show() + a.show();
+    }
+
+    public static void main(String[] args) {
+        Optional<Integer> sum = forj {
+            x <- Optional.of(1);
+            y <- Optional.of(2);
+        } yield x + y;
+        Integer n = 7;
+        System.out.println(s"sum=${sum.get()} shown=${n.show()} twice=${twice(3)} combined=${n.combine(5)}");
+    }
+}
+EOF
+
+expected="sum=3 shown=#7 twice=#3#3 combined=12"
+cd "$WORK"
+if ! output="$(./mill --no-server app.run 2>&1)"; then
+  echo "$output"
+  echo "check-publish: downstream build failed" >&2
+  exit 1
+fi
+if ! grep -qxF "$expected" <<<"$output"; then
+  echo "$output"
+  echo "check-publish: expected '$expected'" >&2
+  exit 1
+fi
+echo "check-publish: ok ($expected)"

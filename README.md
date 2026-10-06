@@ -162,6 +162,28 @@ object app extends ForjModule
 
 Set `def forjDebug = true` to print each desugared comprehension during compilation.
 
+### Using forj from another build
+
+`./mill __.publishM2Local` publishes `forj:forj-core` (the runtime) and `forj:forj-plugin`
+(compile time only) as `0.1.0-SNAPSHOT` to `~/.m2`. A downstream Mill module then looks like
+this (`bin/check-publish` builds and runs exactly this against the published jars):
+
+```scala
+trait ForjModule extends JavaModule {
+  // forj's class files are preview class files for this exact JDK
+  def javaHome = Task.Input { Some(PathRef(os.Path("/path/to/forj/.jdk/preview"), quick = true)) }
+  def repositories = super.repositories() ++ Seq("m2Local")
+  def mvnDeps = super.mvnDeps() ++ Seq(mvn"forj:forj-core:0.1.0-SNAPSHOT")
+  def compileMvnDeps = super.compileMvnDeps() ++ Seq(mvn"forj:forj-plugin:0.1.0-SNAPSHOT")
+  def jvmOptions = super.jvmOptions() ++ forjCompilerJvmOptions   // pluginJvmOptions in build.mill
+  def javacOptions = super.javacOptions() ++ Seq("--enable-preview", "--source", "28", "-Xplugin:Forj")
+}
+```
+
+The plugin jar carries its `META-INF/services` entry, so nothing else is needed. Consumers must
+compile and run on the same JDK build with `--enable-preview`: the jars hold preview class
+files.
+
 ## Project layout
 
 | Path | What it is |
@@ -189,3 +211,7 @@ This is an experiment. It works and is tested, but:
   class, so `List`, `Optional` and `Callable` values are wrapped: about 3-4 ns per step,
   invisible next to real work (+3% for a 100×100 `List`), noticeable only in hot loops of
   tiny `Optional` chains. `IO` implements `Kind` itself and pays nothing.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE). Contributions are accepted under the same license.

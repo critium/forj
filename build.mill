@@ -3,6 +3,7 @@ package build
 import mill.*
 import mill.api.BuildCtx
 import mill.javalib.*
+import mill.javalib.publish.*
 
 /**
  * Every module compiles, tests and runs on the pinned JDK (fetched by bin/fetch-jdk), with
@@ -27,6 +28,24 @@ def withFlags(options: Seq[String], flags: Seq[String]): Seq[String] =
 
 trait ForjJava extends MavenModule with PinnedJdk {
   def javacOptions = withFlags(super.javacOptions(), Seq("--enable-preview", "--source", "28"))
+  // the published -javadoc jar is built from the same sources, so javadoc needs the same flags
+  def javadocOptions = super.javadocOptions() ++ Seq("--enable-preview", "--source", "28", "-Xdoclint:none")
+}
+
+/**
+ * Published as forj:forj-<name> (./mill __.publishM2Local for ~/.m2). The class files are
+ * preview class files for the pinned JDK, so consumers need the same JDK and --enable-preview.
+ */
+trait ForjPublish extends PublishModule {
+  def publishVersion = "0.1.0-SNAPSHOT"
+  def pomSettings = PomSettings(
+    description = "forj: Scala features for Java, as a javac plugin",
+    organization = "forj",
+    url = "",
+    licenses = Seq(License.`Apache-2.0`),
+    versionControl = VersionControl(),
+    developers = Seq()
+  )
 }
 
 /** JUnit 5 tests; compiler options come from the enclosing module. */
@@ -46,13 +65,18 @@ val pluginJvmOptions = javacInternals ++ Seq("comp", "main", "util")
   .map(p => s"--add-opens=jdk.compiler/com.sun.tools.javac.$p=ALL-UNNAMED")
 
 /** Runtime API: the JDK monad instances and Par. No dependencies. */
-object core extends ForjJava {
+object core extends ForjJava with ForjPublish {
+  def artifactName = "forj-core"
+
   object test extends MavenTests with ForjTests
 }
 
 /** The javac plugin that desugars comprehensions. */
-object plugin extends ForjJava {
+object plugin extends ForjJava with ForjPublish {
+  def artifactName = "forj-plugin"
+
   def javacOptions = super.javacOptions() ++ javacInternals
+  def javadocOptions = super.javadocOptions() ++ javacInternals
   def jvmOptions = super.jvmOptions() ++ pluginJvmOptions
 
   object test extends MavenTests with ForjTests {
