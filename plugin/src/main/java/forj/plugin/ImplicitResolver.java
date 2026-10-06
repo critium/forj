@@ -362,6 +362,13 @@ final class ImplicitResolver {
                 return Outcome.SKIPPED; // an ordinary call; javac handles it
             }
             if (candidates.size() > 1) {
+                // overloads that differ in their ordinary parameters: decode(byte[]) vs decode(InputStream)
+                candidates.removeIf(m -> !accepts(m));
+            }
+            if (candidates.isEmpty()) {
+                return Outcome.SKIPPED; // none takes these arguments; javac reports it
+            }
+            if (candidates.size() > 1) {
                 return error(call, "ambiguous call: " + candidates.size() + " methods named " + name + " take using parameters");
             }
             MethodSymbol method = candidates.getFirst();
@@ -755,10 +762,10 @@ final class ImplicitResolver {
             return argTypes;
         }
 
-        /** Could this ordinary overload take the call's arguments? Unknown counts as yes. */
+        /** Could {@code m}'s ordinary parameters take the call's arguments? Unknown counts as yes. */
         private boolean accepts(MethodSymbol m) {
             List<Type> params = m.type.getParameterTypes();
-            for (int i = 0; i < params.size(); i++) {
+            for (int i = 0; i < call.args.size() && i < params.size(); i++) {
                 Type arg = argTypes().get(i);
                 if (arg != null && !types.isConvertible(arg, types.erasure(params.get(i)))) {
                     return false;

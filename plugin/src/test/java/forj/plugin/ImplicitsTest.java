@@ -192,6 +192,26 @@ class ImplicitsTest {
     }
 
     @Test
+    void usingOverloadsAreChosenByTheirOrdinaryArguments() throws Exception {
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.typeclass.Monoid;
+                import java.io.ByteArrayInputStream;
+                import java.io.InputStream;
+                import java.util.List;
+                public class App {
+                    static <A> String decode(byte[] bytes)(using Monoid<A> m) { return "bytes:" + bytes.length + ":" + m.empty(); }
+                    static <A> String decode(InputStream in)(using Monoid<A> m) { return "stream:" + m.empty(); }
+                    public static Object run() {
+                        return List.of(App.<Integer>decode(new byte[3]),
+                                App.<String>decode(new ByteArrayInputStream(new byte[0])));
+                    }
+                }
+                """));
+        assertEquals(List.of("bytes:3:0", "stream:"), c.call("app.App", "run"));
+    }
+
+    @Test
     void usingOnlyWorksAsItsOwnClause() throws Exception {
         // the pre-Scala-3 spellings `f(A a) using T t {` and `f(A a, using T t)` are not forj syntax
         for (String signature : List.of("static <A> A twice(A a) using Semigroup<A> s",

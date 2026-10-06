@@ -15,7 +15,39 @@ Follow-ups:
 - Later: publish `PinnedJdk`/`ForjJava`/`ForjTests`/`ForjModule` as a Mill plugin so the
   libraries stop copying them (and `bin/fetch-jdk`, `bin/make-preview-jdk`).
 - Still in forj, needed by the libraries afterwards: `Effect`/`ConcurrentEffect` (step 1),
-  `Schema<T>` + `@Derives` + the `derives` rewrite (step 6).
+  `@Derives` + the `derives` rewrite (step 6). No `Schema<T>` in core any more: `derives`
+  generates a call to the type class's own `product(...)` (forj-codec's `Codec.product`).
+
+## Enforce a coding style (2-space indentation)
+
+**Status:** open, added 2026-10-06. The preferred style is 2 spaces; the code is 4 spaces
+today.
+
+- **Formatter:** google-java-format. Its Google style is 2-space indentation and not
+  configurable. Palantir's format is 4 spaces, so it's out.
+  - Mill 1.1.10 has it built in (`mill.javalib.spotless`, and `mill.javalib.palantirformat`
+    for Palantir).
+  - Configure Spotless with google-java-format, plus a check task that fails the build on
+    unformatted files, for CI or a pre-commit hook.
+- **`.editorconfig`** (`indent_style = space`, `indent_size = 2`), so IntelliJ and VS Code
+  type the right indentation in the first place.
+- **The catch, forj syntax:** every Java formatter (google-java-format, Palantir, Eclipse,
+  Checkstyle) parses plain Java, so files using `forj { }`, `<-`, `given`, `(using ...)`,
+  `F<_>` or `s"..."` don't parse.
+  - `core/` and `plugin/` are plain Java (forj snippets in the plugin tests are inside
+    strings): google-java-format, fully enforced.
+  - `examples/` and downstream code using forj syntax: excluded from google-java-format.
+    Only `.editorconfig` and a whitespace check apply there (2-space indentation, no tabs,
+    no trailing spaces, final newline).
+- **Forj-aware formatter (later):** a reversible masking mode in `SourceRewriter`.
+  1. Replace each forj construct with a same-shape Java placeholder.
+  2. Run google-java-format.
+  3. Put the constructs back.
+
+  Belongs with the editor-support work below.
+- **Switching over:** the one-time reformat touches every file. Do it as its own commit and
+  list that commit in `.git-blame-ignore-revs`, so `git blame` skips it
+  (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
 
 ## semanticdb (Metals index) crashes on files that use `forj`
 
@@ -149,6 +181,16 @@ spelling.
   assignment, but not from an argument position: `describe(checkout(order))` can't infer
   `checkout`'s `F` from `describe`'s parameter (which itself comes from `describe`'s target).
   Needs inference across nested calls.
+- **No inference from method references.** `Codec.field("id", User::id)(using Codec<F>)`
+  can't infer `F` from `User::id`, so forj-codec's hand-written codecs spell it out:
+  `Codec.<User, Long>field("id", User::id)`. `derives` knows the component types and can
+  generate that form, but inferring from a method reference's return type would make
+  hand-written code read better.
+- **Overloads that take `using` parameters** are now chosen by their ordinary arguments
+  (`decode(byte[])` vs `decode(InputStream)`, fixed 2026-10-06), so forj-codec can go back to
+  real overloads instead of `read`/`write`. Still ambiguous: overloads that only differ in a
+  parameter whose argument type isn't known yet (an implicit lambda), and no "most specific
+  overload" ranking (e.g. `decode(Object)` vs `decode(String)` with a `String`).
 
 ## Toward real type classes
 
