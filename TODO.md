@@ -17,6 +17,13 @@ Follow-ups:
 - Still in forj, needed by the libraries afterwards: `Effect`/`ConcurrentEffect` (step 1),
   `@Derives` + the `derives` rewrite (step 6). No `Schema<T>` in core any more: `derives`
   generates a call to the type class's own `product(...)` (forj-codec's `Codec.product`).
+  - **Consequence for Smithy (forj-http milestone 2):** the plan had records and `.smithy`
+    shapes produce one shared `Schema`, with protocols interpreting it, so adding a
+    protocol needed no regenerated code. Without it, Smithy codegen emits a
+    `Codec.product(...)` call per format, which is fine for JSON, but each new protocol needs
+    its own generated code.
+  - If pluggable protocols matter then, add `Schema<T>` back as an extra: `derives` keeps
+    calling `X.product(...)` and additionally passes a schema. Decide at Smithy time.
 
 ## Enforce a coding style (2-space indentation)
 
@@ -186,6 +193,17 @@ spelling.
   `Codec.<User, Long>field("id", User::id)`. `derives` knows the component types and can
   generate that form, but inferring from a method reference's return type would make
   hand-written code read better.
+  - **Cost:** about 40–60 lines in `ImplicitResolver.inferTypeArguments`, plus tests. For an
+    argument `Q::m`:
+    1. type-check `Q`;
+    2. find `m`, choosing an overload by arity (only when it's unambiguous);
+    3. bind the function's result type to `m`'s return type.
+
+    That's one more speculative type-check per such argument.
+  - **Implicit lambdas** (`u -> u.id()`) are much harder: typing the body depends on the very
+    inference being done.
+  - **Not urgent:** `derives` generates the explicit form, so this only helps hand-written
+    codecs.
 - **Overloads that take `using` parameters** are now chosen by their ordinary arguments
   (`decode(byte[])` vs `decode(InputStream)`, fixed 2026-10-06), so forj-codec can go back to
   real overloads instead of `read`/`write`. Still ambiguous: overloads that only differ in a
