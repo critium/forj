@@ -89,6 +89,11 @@ asking for more than an effect has is a compile error:
 `forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>`.
 The runnable version is in `examples/.../tagless/`.
 
+JDK types (`Callable`, `List`, `Optional`) aren't a `Kind`, so they're wrapped to take part.
+Opt-in lifting does that for you, per file: with `import static forj.Language.lifting;`,
+`Callable<User> u = decodeF(bytes);`, `xs.map(f)` and `addBoth(callableA, callableB)` work as
+written (see the Java guide, "Automatic lifting").
+
 ## Syntax at a glance
 
 ```java

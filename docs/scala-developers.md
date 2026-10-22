@@ -244,6 +244,15 @@ Differences from Scala 3:
   Lookup follows Scala's: the enclosing scope, imports, the type classes of givens in scope,
   the receiver type's classes, then `forj.Syntax`. A method the type has always wins.
 - Explicit type arguments on an extension call (`fa.<B>map(f)`) aren't supported.
+- JDK types aren't a `Kind`, so they're wrapped (`ListK`, `CallableK`). Opt-in lifting, per
+  file like Scala's `import scala.language.x`, does it for you:
+  - `import static forj.Language.liftResults` makes `Callable<User> u = decodeF(bytes)` work;
+  - `liftReceivers` makes `list.map(f)` work;
+  - `liftArguments` makes `addBoth(callableA, callableB)` work;
+  - `lifting` turns on all three.
+
+  It's closer to a scoped implicit conversion into `Kind` than to anything cats does. The Java
+  guide lists where it applies and its caveats.
 - Type parameters that only appear in `using` parameters can't be inferred from the call;
   pass them explicitly (`Owner.<Integer>empty()`).
 - `using` methods are found when declared in sources being compiled or in imported classes.

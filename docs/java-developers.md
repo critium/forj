@@ -494,6 +494,55 @@ Asking for a capability the effect doesn't have is still a compile error:
 `callable.filter(p)` gives `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
 The plain-Java spelling is `@Extension public static`.
 
+## Automatic lifting (opt-in)
+
+JDK types like `Callable`, `List` and `Optional` aren't a `Kind`, so code generic in `F`
+normally needs them wrapped (`new CallableK<>(c)`) and unwrapped (`CallableK.narrow(k)`). Three
+opt-in features let the plugin do it, switched on per file with a static import, like Scala's
+`import scala.language.x`:
+
+```java
+import static forj.Language.liftResults;     // or liftReceivers, liftArguments
+import static forj.Language.lifting;         // all three
+```
+
+| Feature | Without it | With it |
+|---|---|---|
+| `liftResults` | `Kind<Callable, User> u = Json.decodeF(bytes);` | `Callable<User> u = Json.decodeF(bytes);`: `F` is inferred from the JDK type, and the value unwrapped |
+| `liftReceivers` | `new ListK<>(xs).map(f)` | `xs.map(f)` |
+| `liftArguments` | `addBoth(new CallableK<>(a), new CallableK<>(b))` | `addBoth(a, b)` |
+
+They compose, so with `lifting` this works end to end:
+
+```java
+List<Integer> doubled = List.of(1, 2, 3).map(x -> x * 2).filter(x -> x > 2);   // [4, 6]
+```
+
+The wrapping uses the same `forjLift` overloads and `@Lower` methods as comprehensions, so a
+library type that supports `forj { }` (see "Adding your own types") lifts too, once its class
+is statically imported.
+
+**What to keep in mind** (the reason it's opt-in):
+- **It's silent.** A method or extension that expects an `F<A>` accepts a JDK value whenever a
+  `forjLift` exists for its type, and a result assigned to a JDK type is unwrapped. Nothing at
+  the call site shows the conversion.
+- **A type's own method still wins.** `optional.map(f)` is `Optional.map`, not `Syntax.map`.
+  Lifting only applies when the type has no method of that name.
+- **Where it applies:**
+  - `liftResults`: typed locals, `return` and assignments (the same places `F` is inferred
+    from), not inside expression lambdas or `var` locals;
+  - `liftArguments`: methods with `using` parameters only. A method that takes a `Kind` but no
+    `using` parameter gets no lifting;
+  - an argument whose type isn't known yet, such as an implicit lambda (`addBoth(() -> 1, ...)`),
+    isn't lifted. Give it a type first (`Callable<Integer> one = () -> 1;`).
+- **Ambiguity:** a value that more than one `forjLift` accepts (a class that is both a `List`
+  and a `Callable`) isn't lifted, and you get javac's usual error.
+- **Chains need `liftResults` to come back:** `xs.map(f)` with only `liftReceivers` is a
+  `Kind<List, B>`; assigning it to a `List<B>` needs `liftResults` too (or `lifting`).
+- **Cost:** one wrapper object per lift, the same as writing `new ListK<>(...)` by hand.
+- **Capabilities are still checked:** `callable.filter(p)` is still
+  `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
+
 ## Context parameters: passing things through without passing them
 
 `using` isn't only for type classes. It also carries context that a lot of code needs and

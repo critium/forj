@@ -124,6 +124,31 @@ final class ImplicitResolver {
     private final Set<Name> extensionNames = new java.util.HashSet<>();
     private final Set<Name> indexedPackages = new java.util.HashSet<>();
 
+    // opt-in features (forj.Language), switched on per file by `import static forj.Language.x;`
+    private static final String LIFT_RESULTS = "liftResults";
+    private static final String LIFT_RECEIVERS = "liftReceivers";
+    private static final String LIFT_ARGUMENTS = "liftArguments";
+    private final Map<JCCompilationUnit, Set<String>> features = new HashMap<>();
+
+    /** The forj.Language features a file imports; {@code lifting} and {@code *} mean all three. */
+    private Set<String> features(JCCompilationUnit unit) {
+        return features.computeIfAbsent(unit, u -> {
+            Set<String> on = new java.util.HashSet<>();
+            for (JCTree def : u.defs) {
+                if (def instanceof JCImport imp && imp.staticImport
+                        && imp.qualid.selected.toString().equals("forj.Language")) {
+                    String feature = imp.qualid.name.toString();
+                    if (feature.equals("*") || feature.equals("lifting")) {
+                        on.addAll(List.of(LIFT_RESULTS, LIFT_RECEIVERS, LIFT_ARGUMENTS));
+                    } else {
+                        on.add(feature);
+                    }
+                }
+            }
+            return on;
+        });
+    }
+
     ImplicitResolver(Context context, Trees trees, javax.lang.model.util.Elements elements,
                      ClassSymbol givenAnnotation, ClassSymbol usingAnnotation) {
         this.elements = elements;
@@ -363,7 +388,7 @@ final class ImplicitResolver {
             }
             if (candidates.size() > 1) {
                 // overloads that differ in their ordinary parameters: decode(byte[]) vs decode(InputStream)
-                candidates.removeIf(m -> !accepts(m));
+                candidates.removeIf(m -> !accepts(m, enabled(LIFT_ARGUMENTS)));
             }
             if (candidates.isEmpty()) {
                 return Outcome.SKIPPED; // none takes these arguments; javac reports it
@@ -376,11 +401,17 @@ final class ImplicitResolver {
                 return error(call, "using parameters of " + method + " must come last");
             }
 
+            if (enabled(LIFT_ARGUMENTS) && liftArguments(method)) {
+                argTypes = null;   // the lifted arguments are Kinds now: infer from those
+            }
             Map<TypeVar, Type> bindings = inferTypeArguments(method);
             if (method.type.getTypeArguments().stream().anyMatch(tv -> !bindings.containsKey((TypeVar) tv))) {
                 Type target = targetType();
                 if (target != null && !target.isErroneous()) {
-                    unify(method.type.getReturnType(), target, bindings, method.type.getTypeArguments());
+                    Lowering lowering = enabled(LIFT_RESULTS) ? lowering(target) : null;
+                    // a JDK target (Callable<User>) stands for the Kind its @Lower method takes
+                    unify(method.type.getReturnType(), lowering != null ? lowering.kind() : target, bindings,
+                            method.type.getTypeArguments());
                 }
             }
             trace("  args " + argTypes() + " bindings " + bindings);
@@ -405,6 +436,115 @@ final class ImplicitResolver {
                 typeLambdaParameters(method, bindings);
             }
             return Outcome.RESOLVED;
+        }
+
+        private boolean enabled(String feature) {
+            return features(unit).contains(feature);
+        }
+
+        /** liftArguments: wraps each JDK value passed where {@code method} expects a Kind. */
+        private boolean liftArguments(MethodSymbol method) {
+            List<Type> paramTypes = method.type.getParameterTypes();
+            ListBuffer<JCExpression> args = new ListBuffer<>();
+            boolean changed = false;
+            for (int i = 0; i < call.args.size(); i++) {
+                JCExpression arg = call.args.get(i);
+                Type type = argTypes().get(i);
+                Type param = types.erasure(paramTypes.get(i));
+                if (type != null && isKindType(param) && !types.isConvertible(type, param)) {
+                    JCExpression lifted = lift(arg, type);
+                    if (lifted != null) {
+                        arg = lifted;
+                        changed = true;
+                    }
+                }
+                args.append(arg);
+            }
+            if (changed) {
+                call.args = args.toList();
+            }
+            return changed;
+        }
+
+        private boolean isKindType(Type erased) {
+            return kindSymbol != null && types.asSuper(erased, kindSymbol) != null;
+        }
+
+        /**
+         * {@code expr} (of JDK type {@code type}) wrapped by the one {@code forjLift} overload
+         * that takes it, with explicit type arguments ({@code forj.For.<Integer>forjLift(xs)}),
+         * so javac doesn't treat it as a poly expression cached by position. Null when no
+         * overload takes it, or more than one does.
+         */
+        private JCExpression lift(JCExpression expr, Type type) {
+            if (type == null || type.isErroneous() || isKindType(type)) {
+                return null;
+            }
+            MethodSymbol found = null;
+            for (Symbol s : liftCandidates()) {
+                if (!(s instanceof MethodSymbol m) || m.params().size() != 1 || (m.flags() & Flags.STATIC) == 0) {
+                    continue;
+                }
+                Type param = types.erasure(m.type.getParameterTypes().head);
+                if (isKindType(param) || !types.isConvertible(type, param)) {
+                    continue;   // the identity overloads, or one for another type
+                }
+                if (found != null && found != m) {
+                    return null; // ambiguous: say, a class that is both a List and a Callable
+                }
+                found = m;
+            }
+            if (found == null) {
+                return null;
+            }
+            Map<TypeVar, Type> bindings = new HashMap<>();
+            List<Type> tvars = found.type.getTypeArguments();
+            unify(found.type.getParameterTypes().head, type, bindings, tvars);
+            ListBuffer<JCExpression> typeArgs = new ListBuffer<>();
+            for (Type tv : tvars) {
+                Type bound = bindings.get((TypeVar) tv);
+                if (bound == null) {
+                    return null;
+                }
+                typeArgs.append(typeTree(bound));
+            }
+            make.at(expr.pos);
+            return make.Apply(typeArgs.toList(), make.Select(qualified((ClassSymbol) found.owner), found.name),
+                    com.sun.tools.javac.util.List.of(expr));
+        }
+
+        /** {@code forjLift} overloads in scope: forj's own and any statically imported. */
+        private Set<Symbol> liftCandidates() {
+            Set<Symbol> found = new LinkedHashSet<>();
+            if (forClass != null) {
+                forClass.members().getSymbolsByName(forjLift).forEach(found::add);
+            }
+            unit.namedImportScope.getSymbolsByName(forjLift).forEach(found::add);
+            unit.starImportScope.getSymbolsByName(forjLift).forEach(found::add);
+            return found;
+        }
+
+        /** How a JDK target type is reached from a Kind: its @Lower method, applied with these bindings. */
+        private record Lowering(MethodSymbol method, Type kind, Map<TypeVar, Type> bindings) {}
+
+        /** The @Lower method returning {@code target}'s type (Callable<User> from Kind<Callable, User>), if any. */
+        private Lowering lowering(Type target) {
+            if (target == null || target.isErroneous() || isKindType(target)) {
+                return null;
+            }
+            for (Symbol s : lowerCandidates()) {
+                if (!(s instanceof MethodSymbol m) || m.params().size() != 1
+                        || !types.isSameType(types.erasure(m.type.getReturnType()), types.erasure(target))) {
+                    continue;
+                }
+                Map<TypeVar, Type> bindings = new HashMap<>();
+                List<Type> tvars = m.type.getTypeArguments();
+                unify(m.type.getReturnType(), target, bindings, tvars);
+                if (tvars.stream().allMatch(tv -> bindings.containsKey((TypeVar) tv))) {
+                    return new Lowering(m, substitute(m.type.getParameterTypes().head, bindings), bindings);
+                }
+            }
+            return null;
         }
 
         /**
@@ -468,9 +608,17 @@ final class ImplicitResolver {
             if (!own.isEmpty()) {
                 return Outcome.SKIPPED;         // the type's own method wins, as in Scala
             }
+            JCExpression liftedReceiver = null;
+            boolean liftable = enabled(LIFT_RECEIVERS) && (liftedReceiver = lift(select.selected, receiver)) != null;
             for (List<MethodSymbol> level : extensionLevels(name, receiver)) {
                 Type r = receiver;
                 List<MethodSymbol> fits = level.stream().filter(m -> takesReceiver(m, r)).toList();
+                boolean lifted = false;
+                if (fits.isEmpty() && liftable) {
+                    // liftReceivers: a JDK value (List, Callable) for an extension on Kind
+                    fits = level.stream().filter(this::takesLiftedReceiver).toList();
+                    lifted = !fits.isEmpty();
+                }
                 if (fits.size() > 1) {
                     return error(call, "ambiguous extension methods for " + name + ": "
                             + fits.stream().map(ImplicitResolver::describe).toList());
@@ -480,7 +628,7 @@ final class ImplicitResolver {
                     indexMembers((ClassSymbol) m.owner);   // its using parameters, if from a library
                     make.at(select.pos);
                     call.meth = make.Select(qualified((ClassSymbol) m.owner), name);
-                    call.args = call.args.prepend(select.selected);
+                    call.args = call.args.prepend(lifted ? liftedReceiver : select.selected);
                     return Outcome.RESOLVED;
                 }
             }
@@ -495,6 +643,14 @@ final class ImplicitResolver {
                 return false;
             }
             return types.isConvertible(receiver, types.erasure(m.type.getParameterTypes().head));
+        }
+
+        /** An extension on Kind that takes this call's arguments, once the receiver is lifted. */
+        private boolean takesLiftedReceiver(MethodSymbol m) {
+            int params = m.params().size();
+            int explicit = call.args.size() + 1;
+            return (params == explicit || params - usingCount(m) == explicit)
+                    && isKindType(types.erasure(m.type.getParameterTypes().head));
         }
 
         private List<List<MethodSymbol>> extensionLevels(Name name, Type receiver) {
@@ -589,6 +745,18 @@ final class ImplicitResolver {
             JCExpression wrapped = make.Apply(com.sun.tools.javac.util.List.nil(),
                     make.Select(qualified(forClass), names.fromString("forjNarrow")),
                     com.sun.tools.javac.util.List.of(call));
+            Lowering lowering = enabled(LIFT_RESULTS) ? lowering(targetType()) : null;
+            if (lowering != null) {
+                // liftResults: a JDK target gets the value unwrapped, forj.For.<User>lowerCallable(call)
+                ListBuffer<JCExpression> typeArgs = new ListBuffer<>();
+                for (Type tv : lowering.method().type.getTypeArguments()) {
+                    typeArgs.append(typeTree(lowering.bindings().get((TypeVar) tv)));
+                }
+                make.at(call.meth.pos);
+                wrapped = make.Apply(typeArgs.toList(),
+                        make.Select(qualified((ClassSymbol) lowering.method().owner), lowering.method().name),
+                        com.sun.tools.javac.util.List.of(call));
+            }
             switch (path.getParentPath().getLeaf()) {
                 case JCVariableDecl v -> v.init = wrapped;
                 case JCReturn r -> r.expr = wrapped;
@@ -764,10 +932,17 @@ final class ImplicitResolver {
 
         /** Could {@code m}'s ordinary parameters take the call's arguments? Unknown counts as yes. */
         private boolean accepts(MethodSymbol m) {
+            return accepts(m, false);
+        }
+
+        /** As {@link #accepts(MethodSymbol)}; with {@code lifting}, a liftable JDK value also fits a Kind parameter. */
+        private boolean accepts(MethodSymbol m, boolean lifting) {
             List<Type> params = m.type.getParameterTypes();
             for (int i = 0; i < call.args.size() && i < params.size(); i++) {
                 Type arg = argTypes().get(i);
-                if (arg != null && !types.isConvertible(arg, types.erasure(params.get(i)))) {
+                Type param = types.erasure(params.get(i));
+                if (arg != null && !types.isConvertible(arg, param)
+                        && !(lifting && isKindType(param) && lift(call.args.get(i), arg) != null)) {
                     return false;
                 }
             }

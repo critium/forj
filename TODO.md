@@ -251,14 +251,26 @@ retroactive instances. These are the gaps, most valuable first.
    Follow-ups:
    - `Resource`, `Timer`/`Clock`, `LiftIO` (`Effect`/`ConcurrentEffect` are done);
    - law tests for the instances (functor/monad laws, `MonadError` and `Bracket` laws);
-   - automatic lifting and lowering of JDK types at call sites of `F<_>` methods
-     (`addBoth(List.of(1), List.of(2))` instead of `new ListK<>(...)`, and a `List` back);
+   - automatic lifting and lowering of JDK types: done 2026-10-22, opt-in per file
+     (`import static forj.Language.liftResults` / `liftReceivers` / `liftArguments` /
+     `lifting`). Gaps:
+     - not in expression lambdas;
+     - not for methods without `using` parameters;
+     - not for arguments of unknown type (implicit lambdas);
+     - **bug (found 2026-10-22 in forj-codec):** `liftResults` also rewrites calls whose
+       return type is a bare type variable, not `Kind<F, A>`. With the import,
+       `List<String> xs = Json.decode(bytes);` (where `decode` is
+       `<A> A decode(byte[])(using Codec<A>, JsonBackend)`) infers
+       `A = Kind<List, String>` and fails with
+       `forj: no given forj.json.Codec<forj.Kind<java.util.List,java.lang.String>> for decode`.
+       Same for `Optional<String>`. It should only apply when the method's declared return
+       type is `F<A>`/`Kind<F, A>` with `F` a type parameter being inferred. forj-codec keeps
+       its `liftResults` test in a separate file until this is fixed (`LiftedResultsTest`).
    - a "most specific instance wins" rule if a type ever gets two instances on one ladder.
 3. **Extension syntax.** Done: `extension` methods and `forj.Syntax` (`fa.map(f)`,
    `a.combine(b)`, ...). Follow-ups:
    - explicit type arguments on extension calls (`fa.<B>map(f)`);
-   - extensions on JDK types that aren't a `Kind` (`list.map(f)` on a `java.util.List`
-     needs a lift; see auto-lifting above);
+   - extensions on JDK types that aren't a `Kind`: done with `liftReceivers` (opt-in);
    - operators: Java has no user operators, so `|+|`, `>>`, `*>` stay named methods;
    - extensions declared in a compiled library are found through `import static`, the
      receiver's classes and `forj.Syntax`; a library class reachable only some other way
