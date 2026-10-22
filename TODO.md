@@ -75,28 +75,23 @@ Follow-ups:
 
 ## Found while building forj-http (2026-10-22)
 
-**Status:** open. Each one has a workaround in forj-http (`server/http`), noted below.
+**Status:** three fixed (2026-10-22, `ForjHttpLimitsTest`), one open. forj-http can drop the
+workarounds for the fixed ones.
 
-- **A nested type that redeclares `F<_>` crashes the rewriter.** In `class Outer<F<_>>`, a
-  nested `interface Inner<F<_>> { F<String> run(); }` throws
-  `IndexOutOfBoundsException: Range [86, 84)` from `SourceRewriter.apply` (overlapping
-  edits, apparently one per `F<_>` in scope). Shadowing a type parameter is legal Java.
-  - Repro: those 5 lines alone, compiled with `-Xplugin:Forj`. Naming it `G<_>` compiles.
-  - Workaround: forj-http's nested types use `G<_>` (`Route.Endpoint`, `Routes.Node`).
-- **`using` after a varargs parameter:** `of(Route<F>... routes)(using Applicative<F> ap)`
-  is "varargs parameter must be the last parameter", because the clause is appended after
-  it. Either allow it (pass the instances before the varargs in the rewritten call) or
-  report a `forj:` error saying it isn't supported.
-- **Instance methods: the receiver's type arguments aren't substituted.** For
-  `routes.orNotFound()` with `Routes<IO> routes` and
-  `HttpApp<F> orNotFound()(using Applicative<F> ap)` declared in `Routes<F<_>>`, the
-  resolver looks for `Applicative<F>` (the class's own variable) and reports
-  `forj: no given forj.typeclass.Applicative<F>`, while javac knows it needs
-  `Applicative<IO>`. Likely fix: in `inferTypeArguments`, when the call is `recv.m(...)` on
-  an instance method, speculate `recv`'s type and bind the owner class's type variables from
-  `types.asSuper(recvType, method.owner)` before unifying the arguments.
-  - Workaround: forj-http's app constructor is static, `HttpApp.of(routes)(using
-    Applicative<F>)`, which infers `F` from the argument.
+- **Fixed: a nested type that redeclares `F<_>` crashed the rewriter**
+  (`IndexOutOfBoundsException` from `SourceRewriter.apply`). The outer and inner scopes both
+  covered the inner body, so each `F<X>` there got two overlapping edits. Now each is rewritten
+  once. forj-http's `G<_>` renames (`Route.Endpoint`, `Routes.Node`) can go back to `F<_>`.
+- **Fixed: `using` after a varargs parameter.** `of(Route<F>... routes)(using Applicative<F> ap)`
+  now compiles to `of(@forj.Using Applicative<F> ap, Route<F>... routes)`:
+  - the rewriter writes the `...` as `[]`, and the Desugarer moves the parameter last and makes
+    it varargs again;
+  - the resolver puts the instances before the varargs arguments;
+  - explicit `Routes.of(a, b)(using ap)` works too, and so does a plain Java caller writing
+    `Routes.of(ap, a, b)`.
+- **Fixed: instance methods ignored the receiver's type arguments.** `routes.orNotFound()` on
+  a `Routes<IO>` now looks for `Applicative<IO>`: the resolver binds the owner class's type
+  variables from `asSuper(receiverType, owner)` (wildcard arguments stay unbound).
 - **Arguments that leave `F` unconstrained win over the target.** `Routes<IO> r =
   Routes.of(GET(p).respond(...))(using Applicative<F>)`, where `respond` is
   `<F<_>> Route<F> respond(...)`: speculating the argument alone gives `Route<Object>`, so

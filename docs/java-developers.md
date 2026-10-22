@@ -650,6 +650,10 @@ Compared with Java's `ScopedValue`, which does a similar job at runtime:
   `decode(byte[])(using Codec<A>)` next to `decode(InputStream)(using Codec<A>)` is fine.
   Two overloads that both accept the arguments are still ambiguous: forj doesn't rank the more
   specific one, and an argument whose type isn't known yet (an implicit lambda) accepts either.
+- **A `using` clause after varargs moves in front of them.** javac wants the varargs
+  parameter last, so `of(Route<F>... routes)(using Applicative<F> ap)` compiles to
+  `of(Applicative<F> ap, Route<F>... routes)`. forj callers don't notice. Plain Java callers
+  and reflection see the instance first.
 - **A local named like a package** (`byte[] forj = ...;`) doesn't break generated code: where
   one is in scope, forj calls through `((forj.Syntax) null).map(...)` instead of
   `forj.Syntax.map(...)`. With `-Xlint:static`, javac warns about that call.

@@ -40,11 +40,13 @@ final class SourceRewriter {
      * @param arrows       position of each generator's {@code =}, to whether its binder was {@code _}
      * @param yields       position of each generated {@code yield}
      * @param missingYield position of each {@code forj} not followed by {@code yield}
+     * @param varargs      position of each {@code ...} written as {@code []} because a using
+     *                     clause follows it: the parameter is moved last and made varargs again
      */
     record Result(char[] source, char[] original, PositionMap positions,
-                  Map<Integer, Boolean> arrows, Set<Integer> yields, Set<Integer> missingYield) {
+                  Map<Integer, Boolean> arrows, Set<Integer> yields, Set<Integer> missingYield, Set<Integer> varargs) {
 
-        /** The same result with arrows, yields and missing yields in original-file positions. */
+        /** The same result with its positions in original-file positions. */
         Result inOriginalPositions() {
             Map<Integer, Boolean> a = new HashMap<>();
             arrows.forEach((pos, anonymous) -> a.put(positions.toOriginal(pos), anonymous));
@@ -52,7 +54,9 @@ final class SourceRewriter {
             yields.forEach(pos -> y.add(positions.toOriginal(pos)));
             Set<Integer> m = new HashSet<>();
             missingYield.forEach(pos -> m.add(positions.toOriginal(pos)));
-            return new Result(source, original, positions, a, y, m);
+            Set<Integer> v = new HashSet<>();
+            varargs.forEach(pos -> v.add(positions.toOriginal(pos)));
+            return new Result(source, original, positions, a, y, m, v);
         }
     }
 
@@ -87,7 +91,7 @@ final class SourceRewriter {
     /** Replace [start, end) with text; ties at the same start apply in ascending order. */
     private record Edit(int start, int end, String text, int order, Kind kind) {}
 
-    private enum Kind { TEXT, ARROW, ANONYMOUS_ARROW, YIELD, FORJ_WITHOUT_YIELD }
+    private enum Kind { TEXT, ARROW, ANONYMOUS_ARROW, YIELD, FORJ_WITHOUT_YIELD, VARARGS }
 
     private static final String FORJ = "forj";
     private static final String YIELD = "yield";
@@ -443,6 +447,11 @@ final class SourceRewriter {
      * {@code f(F<A> a)(using Monad<F> m, Show<A> s)} becomes
      * {@code f(F<A> a, @forj.Using Monad<F> m, @forj.Using Show<A> s)}. At a call site the
      * instances are passed explicitly: {@code f(x)(using m, s)} becomes {@code f(x, m, s)}.
+     *
+     * <p>After a varargs parameter, {@code of(Route<F>... rs)(using Monad<F> m)}, the
+     * {@code ...} becomes {@code []} (javac rejects a varargs parameter that isn't last), and
+     * {@link Desugarer} moves the parameter after the using ones and makes it varargs again:
+     * {@code of(@forj.Using Monad<F> m, Route<F>... rs)}.
      */
     private static void usingClause(List<Token> tokens, int using, List<Edit> edits) {
         int close = closingParen(tokens, using + 1);
@@ -463,6 +472,10 @@ final class SourceRewriter {
         if (tokens.get(using - 2).kind == TokenKind.RPAREN) {
             // `)(using` -> `, @forj.Using` (`, ` at a call); with no other parameters, nothing before it
             boolean noParams = tokens.get(using - 3).kind == TokenKind.LPAREN;
+            Token ellipsis = declaration && !noParams ? lastParameterEllipsis(tokens, using - 2) : null;
+            if (ellipsis != null) {
+                edits.add(new Edit(ellipsis.pos, ellipsis.endPos, "[]", 0, Kind.VARARGS));
+            }
             edits.add(new Edit(tokens.get(using - 2).pos, u.endPos, (noParams ? "" : ", ") + replacement, 0, Kind.TEXT));
         } else {
             edits.add(new Edit(u.pos, u.endPos, replacement, 0, Kind.TEXT));
@@ -472,6 +485,35 @@ final class SourceRewriter {
                 edits.add(new Edit(comma.endPos, comma.endPos, " " + USING_ANNOTATION.strip(), 0, Kind.TEXT));
             }
         }
+    }
+
+    /** The {@code ...} of the last parameter in the list that {@code close} closes, or null. */
+    private static Token lastParameterEllipsis(List<Token> tokens, int close) {
+        int depth = 0;
+        for (int j = close - 1; j >= 0; j--) {
+            switch (tokens.get(j).kind) {
+                case RPAREN, RBRACKET, GT -> depth++;
+                case GTGT -> depth += 2;
+                case GTGTGT -> depth += 3;
+                case LPAREN, LBRACKET, LT -> {
+                    if (depth-- == 0) {
+                        return null;
+                    }
+                }
+                case COMMA -> {
+                    if (depth == 0) {
+                        return null;
+                    }
+                }
+                case ELLIPSIS -> {
+                    if (depth == 0) {
+                        return tokens.get(j);
+                    }
+                }
+                default -> {}
+            }
+        }
+        return null;
     }
 
     /** Index of the {@code )} closing the parentheses that {@code from} is inside, or -1. */
@@ -539,6 +581,9 @@ final class SourceRewriter {
      * {@code forj.Kind<F, X>}.
      */
     private static void findHigherKinds(List<Token> tokens, List<Edit> edits) {
+        // a nested type may redeclare the name (`Inner<F<_>>` in `Outer<F<_>>`): both scopes
+        // cover its body, and each `F<X>` there must be rewritten once
+        Set<Integer> rewritten = new HashSet<>();
         for (int i = 1; i + 3 < tokens.size(); i++) {
             Token name = tokens.get(i);
             TokenKind before = tokens.get(i - 1).kind;
@@ -560,7 +605,8 @@ final class SourceRewriter {
                 if (j != i && t.kind == TokenKind.IDENTIFIER && t.name() == name.name()
                         && j + 1 < tokens.size() && tokens.get(j + 1).kind == TokenKind.LT
                         && tokens.get(j - 1).kind != TokenKind.DOT
-                        && !(j + 2 < tokens.size() && tokens.get(j + 2).kind == TokenKind.UNDERSCORE)) {
+                        && !(j + 2 < tokens.size() && tokens.get(j + 2).kind == TokenKind.UNDERSCORE)
+                        && rewritten.add(t.pos)) {
                     edits.add(new Edit(t.pos, tokens.get(j + 1).endPos, "forj.Kind<" + t.name() + ", ", 0, Kind.TEXT));
                 }
             }
@@ -653,6 +699,7 @@ final class SourceRewriter {
         Map<Integer, Boolean> arrows = new HashMap<>();
         Set<Integer> yields = new HashSet<>();
         Set<Integer> missingYield = new HashSet<>();
+        Set<Integer> varargs = new HashSet<>();
         int n = edits.size();
         int[] newStart = new int[n], newEnd = new int[n], origStart = new int[n], origEnd = new int[n];
         int copied = 0;
@@ -667,6 +714,7 @@ final class SourceRewriter {
                 case ANONYMOUS_ARROW -> arrows.put(out.length(), true);
                 case YIELD -> yields.add(out.length());
                 case FORJ_WITHOUT_YIELD -> missingYield.add(out.length());
+                case VARARGS -> varargs.add(out.length());
                 case TEXT -> {}
             }
             out.append(e.text());
@@ -677,7 +725,7 @@ final class SourceRewriter {
         char[] source = new char[out.length()];
         out.getChars(0, out.length(), source, 0);
         return new Result(source, text.toCharArray(), new PositionMap(newStart, newEnd, origStart, origEnd),
-                arrows, yields, missingYield);
+                arrows, yields, missingYield, varargs);
     }
 
     // ----------------------------------------------------------------- tokens

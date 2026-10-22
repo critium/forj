@@ -499,9 +499,13 @@ final class ImplicitResolver {
                 MethodSymbol m = (MethodSymbol) s;
                 int params = m.params().size();
                 int using = usingCount(m);
-                if (params == call.args.size()) {
+                boolean varargs = usingBeforeVarargs(m);
+                if (params == call.args.size() && !varargs) {
                     plainOverload |= accepts(m);
-                } else if (using > 0 && params - using == call.args.size()) {
+                } else if (varargs && usingsInPlace(m)) {
+                    plainOverload = true;   // of(m, a, b): resolved already, or written that way
+                } else if (using > 0 && (params - using == call.args.size()
+                        || varargs && call.args.size() >= params - using - 1)) {
                     candidates.add(m);
                 }
             }
@@ -522,6 +526,18 @@ final class ImplicitResolver {
             if (!usingParamsTrail(method)) {
                 return error(call, "using parameters of " + method + " must come last");
             }
+            if (usingBeforeVarargs(method) && passesUsings(method)) {
+                // of(a, b)(using m), rewritten to of(a, b, m): m goes before the varargs
+                int k = firstUsing(method);
+                int u = usingCount(method);
+                int n = call.args.size();
+                ListBuffer<JCExpression> moved = new ListBuffer<>();
+                moved.addAll(call.args.subList(0, k));
+                moved.addAll(call.args.subList(n - u, n));
+                moved.addAll(call.args.subList(k, n - u));
+                call.args = moved.toList();
+                return Outcome.RESOLVED;
+            }
 
             if (enabled(LIFT_ARGUMENTS) && liftArguments(method)) {
                 argTypes = null;   // the lifted arguments are Kinds now: infer from those
@@ -541,7 +557,10 @@ final class ImplicitResolver {
             ListBuffer<JCExpression> given = new ListBuffer<>();
             List<VarSymbol> params = method.params();
             List<Type> paramTypes = method.type.getParameterTypes();
-            for (int i = call.args.size(); i < params.size(); i++) {
+            for (int i = 0; i < params.size(); i++) {
+                if (!isUsing(params.get(i))) {
+                    continue;
+                }
                 Type required = substitute(paramTypes.get(i), bindings);
                 if (hasUnbound(required, method, bindings)) {
                     return error(call, "cannot infer the type of using parameter " + params.get(i).name + " (" + required
@@ -554,7 +573,13 @@ final class ImplicitResolver {
                 }
                 given.append(found);
             }
-            call.args = call.args.appendList(given.toList());
+            // the using arguments go where the using parameters are: last, or before a varargs one
+            int k = firstUsing(method);
+            ListBuffer<JCExpression> args = new ListBuffer<>();
+            args.addAll(call.args.subList(0, k));
+            args.addAll(given.toList());
+            args.addAll(call.args.subList(k, call.args.size()));
+            call.args = args.toList();
             if (method.owner == forClass || isExtension(method)) {
                 typeLambdaParameters(method, bindings);
             }
@@ -627,14 +652,14 @@ final class ImplicitResolver {
 
         /** liftArguments: wraps each JDK value passed where {@code method} expects a Kind. */
         private boolean liftArguments(MethodSymbol method) {
-            List<Type> paramTypes = method.type.getParameterTypes();
             ListBuffer<JCExpression> args = new ListBuffer<>();
             boolean changed = false;
             for (int i = 0; i < call.args.size(); i++) {
                 JCExpression arg = call.args.get(i);
                 Type type = argTypes().get(i);
-                Type param = types.erasure(paramTypes.get(i));
-                if (type != null && isKindType(param) && !types.isConvertible(type, param)) {
+                Type declared = paramFor(method, i);
+                Type param = declared == null ? null : types.erasure(declared);
+                if (type != null && param != null && isKindType(param) && !types.isConvertible(type, param)) {
                     JCExpression lifted = lift(arg, type);
                     if (lifted != null) {
                         arg = lifted;
@@ -738,12 +763,15 @@ final class ImplicitResolver {
          */
         private void typeLambdaParameters(MethodSymbol method, Map<TypeVar, Type> bindings) {
             List<Type> paramTypes = method.type.getParameterTypes();
-            for (int i = 0; i < call.args.size() && i < paramTypes.size(); i++) {
+            boolean varargs = (method.flags() & Flags.VARARGS) != 0;
+            for (int i = 0; i < call.args.size() && (varargs || i < paramTypes.size()); i++) {
                 if (!(call.args.get(i) instanceof JCLambda lambda)
                         || lambda.paramKind != JCLambda.ParameterKind.IMPLICIT) {
                     continue;
                 }
-                List<Type> inputs = descriptorInputs(substitute(paramTypes.get(i), bindings));
+                Type param = varargs && i >= paramTypes.size() - 1
+                        ? ((ArrayType) paramTypes.getLast()).elemtype : paramTypes.get(i);
+                List<Type> inputs = descriptorInputs(substitute(param, bindings));
                 if (inputs == null || inputs.size() != lambda.params.size()
                         || inputs.stream().anyMatch(t -> hasUnbound(t, method, bindings) || !isPlain(t))) {
                     continue;
@@ -1120,10 +1148,13 @@ final class ImplicitResolver {
 
         /** As {@link #accepts(MethodSymbol)}; with {@code lifting}, a liftable JDK value also fits a Kind parameter. */
         private boolean accepts(MethodSymbol m, boolean lifting) {
-            List<Type> params = m.type.getParameterTypes();
-            for (int i = 0; i < call.args.size() && i < params.size(); i++) {
+            for (int i = 0; i < call.args.size(); i++) {
                 Type arg = argTypes().get(i);
-                Type param = types.erasure(params.get(i));
+                Type declared = paramFor(m, i);
+                if (declared == null) {
+                    break;
+                }
+                Type param = types.erasure(declared);
                 if (arg != null && !types.isConvertible(arg, param)
                         && !(lifting && isKindType(param) && lift(call.args.get(i), arg) != null)) {
                     return false;
@@ -1182,6 +1213,7 @@ final class ImplicitResolver {
         /** Binds the method's type variables from explicit type arguments and argument types. */
         private Map<TypeVar, Type> inferTypeArguments(MethodSymbol method) {
             Map<TypeVar, Type> bindings = new HashMap<>();
+            bindReceiver(method, bindings);
             List<Type> tvars = method.type.getTypeArguments();
             if (call.typeargs.nonEmpty()) {
                 if (call.typeargs.size() != tvars.size()) {
@@ -1195,14 +1227,102 @@ final class ImplicitResolver {
                 }
                 return bindings;
             }
-            List<Type> paramTypes = method.type.getParameterTypes();
             for (int i = 0; i < call.args.size(); i++) {
                 Type arg = argTypes().get(i);
-                if (arg != null) {
-                    unify(paramTypes.get(i), arg, bindings, tvars);
+                Type param = paramFor(method, i);
+                if (arg != null && param != null) {
+                    unify(param, arg, bindings, tvars);
                 }
             }
             return bindings;
+        }
+
+        /**
+         * {@code recv.m(...)} on an instance method of a generic class: binds the class's type
+         * variables from the receiver's type, so {@code routes.orNotFound()} on a
+         * {@code Routes<IO>} needs an {@code Applicative<IO>}, not an {@code Applicative<F>}.
+         */
+        private void bindReceiver(MethodSymbol method, Map<TypeVar, Type> bindings) {
+            if ((method.flags() & Flags.STATIC) != 0 || !(call.meth instanceof JCFieldAccess select)
+                    || isCastedNull(select.selected)) {
+                return;
+            }
+            Type receiver = speculate(select.selected, false);
+            if (receiver == null || receiver.isErroneous()) {
+                return;
+            }
+            Type site = types.asSuper(types.skipTypeVars(receiver, false), method.owner);
+            if (site == null) {
+                return;
+            }
+            List<Type> params = method.owner.type.getTypeArguments();
+            List<Type> args = site.getTypeArguments();
+            for (int i = 0; i < Math.min(params.size(), args.size()); i++) {
+                if (params.get(i) instanceof TypeVar v && !(args.get(i) instanceof WildcardType)) {
+                    bindings.put(v, args.get(i));
+                }
+            }
+        }
+
+        /**
+         * The declared type of the parameter that the call's {@code i}-th ordinary argument goes
+         * to, skipping using parameters; for the varargs part, the element type (or the array,
+         * when one is passed as is). Null when there is none.
+         */
+        private Type paramFor(MethodSymbol m, int i) {
+            List<Type> ordinary = new ArrayList<>();
+            List<VarSymbol> params = m.params();
+            List<Type> declared = m.type.getParameterTypes();
+            for (int j = 0; j < params.size(); j++) {
+                if (!isUsing(params.get(j))) {
+                    ordinary.add(declared.get(j));
+                }
+            }
+            if (usingBeforeVarargs(m) && i >= ordinary.size() - 1) {
+                Type array = ordinary.getLast();
+                Type arg = argTypes().get(i);
+                boolean asArray = call.args.size() == ordinary.size() && arg != null
+                        && types.isConvertible(arg, types.erasure(array));
+                return asArray ? array : ((ArrayType) array).elemtype;
+            }
+            return i < ordinary.size() ? ordinary.get(i) : null;
+        }
+
+        /** Whether the arguments at the using parameters' positions are instances of their types. */
+        private boolean usingsInPlace(MethodSymbol m) {
+            int k = firstUsing(m);
+            int u = usingCount(m);
+            if (call.args.size() < k + u) {
+                return false;
+            }
+            List<Type> paramTypes = m.type.getParameterTypes();
+            for (int j = k; j < k + u; j++) {
+                Type arg = argTypes().get(j);
+                if (arg == null || !types.isConvertible(arg, types.erasure(paramTypes.get(j)))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** Whether the call passes the using arguments itself, after the varargs ones (see SourceRewriter). */
+        private boolean passesUsings(MethodSymbol m) {
+            int k = firstUsing(m);
+            int u = usingCount(m);
+            int n = call.args.size();
+            if (n < k + u) {
+                return false;
+            }
+            List<Type> paramTypes = m.type.getParameterTypes();
+            for (int j = 0; j < u; j++) {
+                Type arg = argTypes().get(n - u + j);
+                if (arg == null || !types.isConvertible(arg, types.erasure(paramTypes.get(k + j)))) {
+                    return false;
+                }
+            }
+            Type element = ((ArrayType) paramTypes.getLast()).elemtype;
+            Type last = argTypes().get(n - 1);
+            return !types.isConvertible(last, types.erasure(element));
         }
 
         /** Type checks a copy of {@code tree} in this call's scope, reporting nothing. */
@@ -1573,16 +1693,38 @@ final class ImplicitResolver {
         return n;
     }
 
+    /** Using parameters come last, or just before a varargs parameter. */
     private boolean usingParamsTrail(MethodSymbol m) {
         boolean seenUsing = false;
-        for (VarSymbol p : m.params()) {
-            if (isUsing(p)) {
+        List<VarSymbol> params = m.params();
+        for (int i = 0; i < params.size(); i++) {
+            if (isUsing(params.get(i))) {
                 seenUsing = true;
-            } else if (seenUsing) {
+            } else if (seenUsing && !(i == params.size() - 1 && (m.flags() & Flags.VARARGS) != 0)) {
                 return false;
             }
         }
         return true;
+    }
+
+    /**
+     * {@code of(@Using Monad<F> m, Route<F>... rs)}: what {@code of(Route<F>... rs)(using Monad<F> m)}
+     * becomes, since javac wants the varargs parameter last.
+     */
+    private boolean usingBeforeVarargs(MethodSymbol m) {
+        List<VarSymbol> params = m.params();
+        return (m.flags() & Flags.VARARGS) != 0 && !params.isEmpty() && !isUsing(params.getLast()) && usingCount(m) > 0;
+    }
+
+    /** Index of the first using parameter (the parameter count when there is none). */
+    private int firstUsing(MethodSymbol m) {
+        List<VarSymbol> params = m.params();
+        for (int i = 0; i < params.size(); i++) {
+            if (isUsing(params.get(i))) {
+                return i;
+            }
+        }
+        return params.size();
     }
 
     /**

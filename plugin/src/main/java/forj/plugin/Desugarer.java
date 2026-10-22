@@ -67,6 +67,7 @@ final class Desugarer extends TreeTranslator {
     private final Map<Integer, Boolean> arrows;
     private final Set<Integer> yields;
     private final Set<Integer> missingYield;
+    private final Set<Integer> varargs;
     private final boolean debug;
 
     private final Name forjPkg, forClass, run, forjBlock, guard, flatMap, map, filter, lift, lower;
@@ -92,6 +93,7 @@ final class Desugarer extends TreeTranslator {
         this.arrows = new HashMap<>(rewrite.arrows());
         this.yields = rewrite.yields();
         this.missingYield = rewrite.missingYield();
+        this.varargs = rewrite.varargs();
         this.debug = debug;
         this.forjPkg = names.fromString("forj");
         this.forClass = names.fromString("For");
@@ -110,6 +112,25 @@ final class Desugarer extends TreeTranslator {
         rejectUnusedArrows();
         if (rewrote) {
             ensureStaticImport();
+        }
+    }
+
+    /**
+     * A varargs parameter followed by a using clause, written as an array by
+     * {@link SourceRewriter}: moved after the using parameters and made varargs again.
+     */
+    @Override
+    public void visitMethodDef(JCTree.JCMethodDecl tree) {
+        super.visitMethodDef(tree);
+        if (varargs.isEmpty()) {
+            return;
+        }
+        for (JCVariableDecl p : tree.params) {
+            if (p.vartype instanceof JCTree.JCArrayTypeTree array && varargs.contains(array.pos)) {
+                p.mods.flags |= com.sun.tools.javac.code.Flags.VARARGS;
+                tree.params = List.filter(tree.params, p).append(p);
+                break;
+            }
         }
     }
 
