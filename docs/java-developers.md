@@ -234,13 +234,26 @@ Generic code asks for capabilities, from the least to the most:
 | `Sync` | `delay`, `suspend` | wrap side effects |
 | `Async` | `async` | wait for a callback |
 | `Concurrent` | `start`, `race`, `parMap2` | do things at the same time |
+| `Effect` (extends `Async`) | `unsafeRunSync(fa)` | run an `F` at the edge, e.g. a server running a handler |
+| `ConcurrentEffect` | `Concurrent` + `Effect` | run an `F` that may do things at the same time |
 
 Beside the ladder: `FunctorFilter` (`filter`, for guards), `Foldable` (`foldLeft`,
 `combineAll`), `Traverse` (`traverse`, `sequence`), and for values `Semigroup` (`combine`) and
 `Monoid` (`combine` plus `empty`).
 
-Each extends the one above it. `IO` has them all; `Callable` stops at `Sync`. Asking for a
-capability the effect doesn't have is a compile error.
+Each extends the one above it (`Effect` branches off `Async`, and `ConcurrentEffect` joins it
+with `Concurrent`). `IO` has them all. `Callable` is an `Effect`, so it can be run and its
+`async` blocks until the callback fires, but it isn't `Concurrent`. Asking for a capability the
+effect doesn't have is a compile error.
+
+`Effect` runs an `F` with `unsafeRunSync(fa)`, or `runSync(fa)`, the same method under a
+plainer name (`IO` has both too). "Unsafe" doesn't mean dangerous: it marks the one call that
+performs the effects, where everything else only describes them. Use it once, at the edge
+of the program (a server running a request, `main`), never inside a `map` or `flatMap`.
+
+There's no callback-style `runAsync`, as in cats-effect 2,
+because blocking a virtual thread is cheap. To run something in the background, call
+`unsafeRunSync` on a virtual thread of its own; to cancel it, interrupt that thread.
 
 ## Tagless final
 

@@ -13,10 +13,11 @@ import java.util.concurrent.TimeoutException;
  *
  * <pre>
  * Functor → Applicative → Monad → ApplicativeError/MonadError → Bracket → Sync → Async → Concurrent
+ *                                                                              ↘ Effect ↘ ConcurrentEffect
  * </pre>
  *
- * Callable is Sync: describe and retry work for it, withTimeout does not compile for it.
- * IO is Concurrent: all three work.
+ * Callable is an Effect but not Concurrent: describe and retry work for it, withTimeout does
+ * not compile for it. IO is a ConcurrentEffect: all three work.
  */
 public final class Ladder {
     private Ladder() {}

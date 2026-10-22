@@ -212,6 +212,43 @@ class ImplicitsTest {
     }
 
     @Test
+    void effectInstancesAreResolvedAndConcurrentEffectNeedsIO() throws Exception {
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import forj.Kind;
+                import forj.data.CallableK;
+                import forj.effect.IO;
+                import forj.typeclass.ConcurrentEffect;
+                import forj.typeclass.Effect;
+                import java.util.List;
+                import java.util.concurrent.Callable;
+                public class App {
+                    static <F, A> A runIt(Kind<F, A> fa)(using Effect<F> effect) throws Exception { return effect.unsafeRunSync(fa); }
+                    static <F, A> A runConcurrently(Kind<F, A> fa)(using ConcurrentEffect<F> effect) throws Exception { return effect.unsafeRunSync(fa); }
+                    public static Object run() throws Exception {
+                        Callable<Integer> c = () -> 1;
+                        return List.of(runIt(new CallableK<>(c)), runIt(IO.pure(2)), runConcurrently(IO.pure(3)));
+                    }
+                }
+                """));
+        assertEquals(List.of(1, 2, 3), c.call("app.App", "run"));
+
+        var missing = compile(Map.of("app/App.java", """
+                package app;
+                import forj.Kind;
+                import forj.data.CallableK;
+                import forj.typeclass.ConcurrentEffect;
+                public class App {
+                    static <F, A> A runConcurrently(Kind<F, A> fa)(using ConcurrentEffect<F> effect) throws Exception { return effect.unsafeRunSync(fa); }
+                    static Object run() throws Exception { return runConcurrently(new CallableK<>(() -> 1)); }
+                }
+                """));
+        assertTrue(missing.errors().stream().anyMatch(e -> e.contains(
+                        "forj: no given forj.typeclass.ConcurrentEffect<java.util.concurrent.Callable>")),
+                missing.errors()::toString);
+    }
+
+    @Test
     void usingOnlyWorksAsItsOwnClause() throws Exception {
         // the pre-Scala-3 spellings `f(A a) using T t {` and `f(A a, using T t)` are not forj syntax
         for (String signature : List.of("static <A> A twice(A a) using Semigroup<A> s",

@@ -3,19 +3,23 @@ package forj;
 import forj.data.CallableK;
 import forj.data.ListK;
 import forj.data.OptionalK;
+import forj.data.Either;
 import forj.data.Unit;
 import forj.typeclass.Applicative;
 import forj.typeclass.FunctorFilter;
 import forj.typeclass.Monad;
 import forj.typeclass.Monoid;
-import forj.typeclass.Sync;
+import forj.typeclass.Effect;
 import forj.typeclass.Traverse;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 
@@ -162,8 +166,12 @@ public final class Instances {
 
     // ------------------------------------------------------------------ Callable
 
-    /** Callable is a lazy effect: Sync, but not FunctorFilter (a guard has nothing to drop). */
-    public static final class CallableInstances implements Sync<Callable> {
+    /**
+     * Callable is a lazy effect that can be run (Effect), but not Concurrent and not
+     * FunctorFilter (a guard has nothing to drop). Its {@code async} blocks the calling
+     * thread until the callback fires, which is cheap on a virtual thread.
+     */
+    public static final class CallableInstances implements Effect<Callable> {
         private CallableInstances() {}
 
         private static <A> Kind<Callable, A> k(Callable<A> c) {
@@ -225,6 +233,24 @@ public final class Instances {
         @Override
         public <A> Kind<Callable, A> delay(Callable<? extends A> thunk) {
             return k(thunk::call);
+        }
+
+        @Override
+        public <A> Kind<Callable, A> async(Consumer<Consumer<Either<Throwable, A>>> register) {
+            return k(() -> {
+                var result = new CompletableFuture<A>();
+                register.accept(outcome -> outcome.fold(result::completeExceptionally, result::complete));
+                try {
+                    return result.get();
+                } catch (ExecutionException e) {
+                    throw e.getCause() instanceof Exception ex ? ex : new RuntimeException(e.getCause());
+                }
+            });
+        }
+
+        @Override
+        public <A> A unsafeRunSync(Kind<Callable, A> fa) throws Exception {
+            return CallableK.narrow(fa).call();
         }
     }
 }

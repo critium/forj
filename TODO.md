@@ -14,8 +14,9 @@ Follow-ups:
   should own fetching the JDK instead.
 - Later: publish `PinnedJdk`/`ForjJava`/`ForjTests`/`ForjModule` as a Mill plugin so the
   libraries stop copying them (and `bin/fetch-jdk`, `bin/make-preview-jdk`).
-- Still in forj, needed by the libraries afterwards: `Effect`/`ConcurrentEffect` (step 1),
-  `@Derives` + the `derives` rewrite (step 6). No `Schema<T>` in core any more: `derives`
+- Still in forj, needed by the libraries afterwards: `@Derives` + the `derives` rewrite
+  (step 6). (`Effect`/`ConcurrentEffect`, step 1, are done: `forj.typeclass`, with `IO` a
+  `ConcurrentEffect` and `Callable` an `Effect`.) No `Schema<T>` in core any more: `derives`
   generates a call to the type class's own `product(...)` (forj-codec's `Codec.product`).
   - **Consequence for Smithy (forj-http milestone 2):** the plan had records and `.smithy`
     shapes produce one shared `Schema`, with protocols interpreting it, so adding a
@@ -24,6 +25,32 @@ Follow-ups:
     its own generated code.
   - If pluggable protocols matter then, add `Schema<T>` back as an extra: `derives` keeps
     calling `X.product(...)` and additionally passes a schema. Decide at Smithy time.
+
+## Annotation processors break forj syntax
+
+**Status:** open, found 2026-10-06 in forj-codec's JMH benchmarks.
+
+- **Symptom:** with any annotation processor on the compile classpath (JMH's
+  `jmh-generator-annprocess` here; Lombok, MapStruct, Dagger, Immutables would be the same),
+  every file using forj syntax fails to compile with plain javac parse errors
+  (`Model.java:19: error: ';' expected` on a `given` line). With `-proc:none` it compiles.
+- **Likely cause:** annotation processing makes javac parse the sources again, through a parser
+  factory or context that forj's parser swap doesn't reach. Not investigated yet.
+- **Workaround in forj-codec:** the bench module compiles with `-proc:none` and generates
+  JMH's harness from the compiled classes with JMH's bytecode generator.
+- **Why it matters:** many real projects run annotation processors, so this blocks adopting
+  forj in them. Needs a plugin test with a trivial processor on the classpath.
+
+## Generated code can be shadowed by locals named like a package
+
+**Status:** open, found 2026-10-06.
+
+- The resolver inserts fully qualified references, such as `forj.json.Codec.list(...)`. A local
+  variable named `forj` (`byte[] forj = Json.encode(user);`) shadows the `forj` package, so
+  the inserted reference fails with `cannot find symbol: variable json, location: variable
+  forj`.
+- **Fix:** build the inserted references from symbols (`make.QualIdent(sym)` or equivalent)
+  rather than from dotted names, so name lookup can't capture them.
 
 ## Enforce a coding style (2-space indentation)
 
@@ -222,7 +249,7 @@ retroactive instances. These are the gaps, most valuable first.
 2. **Higher-kinded type classes.** Done: `Kind<F, A>` with raw classes as witnesses, the CE2
    ladder in `forj.typeclass`, `IO`, `F<_>` syntax, comprehensions through `Monad<F>`.
    Follow-ups:
-   - `Resource`, `Timer`/`Clock`, `Effect`/`ConcurrentEffect`, `LiftIO`;
+   - `Resource`, `Timer`/`Clock`, `LiftIO` (`Effect`/`ConcurrentEffect` are done);
    - law tests for the instances (functor/monad laws, `MonadError` and `Bracket` laws);
    - automatic lifting and lowering of JDK types at call sites of `F<_>` methods
      (`addBoth(List.of(1), List.of(2))` instead of `new ListK<>(...)`, and a `List` back);

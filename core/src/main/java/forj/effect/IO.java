@@ -4,7 +4,7 @@ import forj.Given;
 import forj.Kind;
 import forj.data.Either;
 import forj.data.Unit;
-import forj.typeclass.Concurrent;
+import forj.typeclass.ConcurrentEffect;
 import forj.typeclass.Fiber;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -146,6 +146,11 @@ public abstract sealed class IO<A> implements Kind<IO, A> {
     }
 
     // ------------------------------------------------------------------- running
+
+    /** {@link #unsafeRunSync()} under a plainer name: same method, same caveat (it performs the effects). */
+    public final A runSync() throws Exception {
+        return unsafeRunSync();
+    }
 
     /** Runs this IO on the calling thread and returns its result, or throws its error. */
     @SuppressWarnings("unchecked")
@@ -318,7 +323,7 @@ public abstract sealed class IO<A> implements Kind<IO, A> {
     @Given
     public static final IOConcurrent concurrent = new IOConcurrent();
 
-    public static final class IOConcurrent implements Concurrent<IO> {
+    public static final class IOConcurrent implements ConcurrentEffect<IO> {
         private IOConcurrent() {}
 
         @Override
@@ -375,6 +380,11 @@ public abstract sealed class IO<A> implements Kind<IO, A> {
         @Override
         public <A, B, C> Kind<IO, C> parMap2(Kind<IO, A> fa, Kind<IO, B> fb, BiFunction<? super A, ? super B, ? extends C> f) {
             return IO.parMap2(fa, fb, f);
+        }
+
+        @Override
+        public <A> A unsafeRunSync(Kind<IO, A> fa) throws Exception {
+            return narrow(fa).unsafeRunSync();
         }
     }
 }

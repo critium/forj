@@ -82,7 +82,8 @@ Receipt receipt = program.unsafeRunSync();              // nothing ran until her
 ```
 
 The ladder is `Functor` → `Applicative` → `Monad` → `MonadError` → `Bracket` → `Sync` →
-`Async` → `Concurrent`. `IO` is lazy and stack safe, and runs on virtual threads, with fibers,
+`Async` → `Concurrent`, plus `Effect` and `ConcurrentEffect` for effects that can be run at
+the edge (`effect.unsafeRunSync(fa)`, what a server does with each request). `IO` is lazy and stack safe, and runs on virtual threads, with fibers,
 `race` and `parMap2` on structured concurrency. A function asks for the least it needs, and
 asking for more than an effect has is a compile error:
 `forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>`.

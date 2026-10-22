@@ -93,6 +93,7 @@ by an `Optional` one doesn't compile.
 | `Functor`, `Applicative`, `Monad` | same names in `forj.typeclass` |
 | `ApplicativeError[F, E]`, `MonadError[F, E]` | same |
 | `Bracket[F, E]`, `Sync[F]`, `Async[F]`, `Concurrent[F]` | same (`Sync` is `Bracket<F, Throwable>`) |
+| `Effect[F]`, `ConcurrentEffect[F]` | same; running is `effect.unsafeRunSync(fa)`, or its alias `runSync(fa)` (blocking, on the calling virtual thread), instead of `runAsync`/`runCancelable` |
 | `Fiber[F, A]` with `join` / `cancel` | same |
 | `Traverse`, `Foldable`, `FunctorFilter` | same (`Traverse` extends `Foldable`) |
 | `import cats.syntax.all._` (`fa.map`, `fa.attempt`, `a \|+\| b`, ...) | `forj.Syntax`, always in scope: `fa.map(f)`, `fa.attempt()`, `a.combine(b)`, ... |
@@ -102,8 +103,11 @@ by an `Optional` one doesn't compile.
 | `implicit` instances, `F: Sync` context bounds | `given`, `using Sync<F> sync` |
 | tagless final algebras `trait Repo[F[_]]` | `interface Repo<F<_>>` |
 
-Differences: no `Resource`, `Timer`, `ContextShift`, `Effect`/`ConcurrentEffect` or
-`LiftIO`; cancellation is thread interruption, checked between `IO` steps and
+Differences: no `Resource`, `Timer`, `ContextShift` or `LiftIO`; no `runAsync` or
+`runCancelable` on `Effect`, because blocking a virtual thread is cheap. CE2 needed them
+since its `IO` ran on a small pool, or on Scala.js's single thread. To run asynchronously,
+call `unsafeRunSync` on a virtual thread of its own; to cancel, interrupt that thread, and
+`IO` stops at the next step and runs its finalizers; cancellation is thread interruption, checked between `IO` steps and
 at blocking calls, rather than CE's cancellation tokens; `IO` blocks a virtual thread instead
 of running on a fiber scheduler, so there is no `tailRecM` (the interpreter is stack safe on
 its own).
@@ -111,7 +115,7 @@ its own).
 ## Effects: `Callable` and `IO`, not `Future`
 
 `CompletableFuture` behaves like Scala's `Future`: it starts running when it's created.
-forj supports `Callable` (lazy, `Sync`) and its own `IO` (lazy, `Concurrent`) instead:
+forj supports `Callable` (lazy, `Effect`) and its own `IO` (lazy, `ConcurrentEffect`) instead:
 
 ```java
 Callable<String> dashboard = forj {
