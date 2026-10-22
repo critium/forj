@@ -408,8 +408,9 @@ final class ImplicitResolver {
             if (method.type.getTypeArguments().stream().anyMatch(tv -> !bindings.containsKey((TypeVar) tv))) {
                 Type target = targetType();
                 if (target != null && !target.isErroneous()) {
-                    Lowering lowering = enabled(LIFT_RESULTS) ? lowering(target) : null;
-                    // a JDK target (Callable<User>) stands for the Kind its @Lower method takes
+                    // a JDK target (Callable<User>) stands for the Kind its @Lower method takes, but only
+                    // for methods returning a Kind: `<A> A decode(...)` into a List<String> means A = List<String>
+                    Lowering lowering = enabled(LIFT_RESULTS) && returnsKind(method) ? lowering(target) : null;
                     unify(method.type.getReturnType(), lowering != null ? lowering.kind() : target, bindings,
                             method.type.getTypeArguments());
                 }

@@ -50,6 +50,27 @@ class LiftingTest {
     }
 
     @Test
+    void liftResultsLeavesMethodsThatDontReturnAKindAlone() throws Exception {
+        // regression (found by forj-codec): `<A> A decode(...)` into a List<String> is A = List<String>,
+        // not A = Kind<List, String>
+        var c = compile(Map.of("app/App.java", """
+                package app;
+                import static forj.Language.liftResults;
+                import java.util.List;
+                public class App {
+                    interface Parse<A> { A parse(String s); }
+                    given Parse<List<String>> words = s -> List.of(s.split(" "));
+                    static <A> A decode(String s)(using Parse<A> p) { return p.parse(s); }
+                    public static Object run() {
+                        List<String> xs = decode("a b");
+                        return xs;
+                    }
+                }
+                """));
+        assertEquals(List.of("a", "b"), c.call("app.App", "run"));
+    }
+
+    @Test
     void withoutTheImportNothingIsLifted() throws Exception {
         var c = compile(Map.of("app/App.java", """
                 package app;
