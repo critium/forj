@@ -60,6 +60,11 @@ public final class ForjPlugin implements Plugin {
         }
 
         List<JCCompilationUnit> parsed = new ArrayList<>();
+        // forj identifiers the desugarer generates, bound to the forj package by the resolver
+        java.util.Set<com.sun.tools.javac.tree.JCTree.JCIdent> generatedQualifiers =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        // givens the deriver added, for the resolver to specialize
+        List<Deriver.Derivation> derivations = new ArrayList<>();
         ImplicitResolver[] implicits = {null};
 
         task.addTaskListener(new TaskListener() {
@@ -70,8 +75,9 @@ public final class ForjPlugin implements Plugin {
                     var rewrite = rewrites.remove(e.getSourceFile());
                     if (rewrite != null) {
                         ForjParserFactory.restoreOriginalPositions(unit, rewrite, log);
-                        new Desugarer(context, trees, unit, rewrite.inOriginalPositions(), debug).run();
+                        new Desugarer(context, trees, unit, rewrite.inOriginalPositions(), debug, generatedQualifiers).run();
                     }
+                    new Deriver(context, unit, derivations).run();   // records with @Derives / derives
                     parsed.add(unit);
                 }
             }
@@ -87,7 +93,8 @@ public final class ForjPlugin implements Plugin {
                     if (given == null || using == null) {
                         return; // forj's core isn't on the classpath: nothing can be given
                     }
-                    implicits[0] = new ImplicitResolver(context, trees, task.getElements(), given, using);
+                    implicits[0] = new ImplicitResolver(context, trees, task.getElements(), given, using, generatedQualifiers,
+                            derivations);
                     parsed.forEach(implicits[0]::index);
                 }
                 implicits[0].resolve((JCCompilationUnit) e.getCompilationUnit(), e.getTypeElement());

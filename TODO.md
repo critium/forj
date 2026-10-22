@@ -14,8 +14,17 @@ Follow-ups:
   should own fetching the JDK instead.
 - Later: publish `PinnedJdk`/`ForjJava`/`ForjTests`/`ForjModule` as a Mill plugin so the
   libraries stop copying them (and `bin/fetch-jdk`, `bin/make-preview-jdk`).
-- Still in forj, needed by the libraries afterwards: `@Derives` + the `derives` rewrite
-  (step 6). (`Effect`/`ConcurrentEffect`, step 1, are done: `forj.typeclass`, with `IO` a
+- `@Derives` + the `derives` rewrite (step 6): **done 2026-10-22.**
+  - The generic `product`/`field` convention, plus the optional specialized
+    `deriveProduct`/`deriveField` encoder; see the Java guide, "Deriving instances".
+  - Follow-ups:
+    - specialized decoding (`deriveRead` overloads picked by a witness argument);
+    - the specialized form for generic records;
+    - sealed-interface sums;
+    - self-recursive records (needs a lazy instance, e.g. an optional `X.lazy(Supplier)`
+      convention);
+    - forj-codec: implement `deriveProduct`/`deriveField` in `Codec`, then rerun the encode
+      benchmarks. (`Effect`/`ConcurrentEffect`, step 1, are done: `forj.typeclass`, with `IO` a
   `ConcurrentEffect` and `Callable` an `Effect`.) No `Schema<T>` in core any more: `derives`
   generates a call to the type class's own `product(...)` (forj-codec's `Codec.product`).
   - **Consequence for Smithy (forj-http milestone 2):** the plan had records and `.smithy`
@@ -28,29 +37,72 @@ Follow-ups:
 
 ## Annotation processors break forj syntax
 
-**Status:** open, found 2026-10-06 in forj-codec's JMH benchmarks.
+**Status:** fixed 2026-10-22 (found 2026-10-06 in forj-codec's JMH benchmarks).
 
-- **Symptom:** with any annotation processor on the compile classpath (JMH's
-  `jmh-generator-annprocess` here; Lombok, MapStruct, Dagger, Immutables would be the same),
-  every file using forj syntax fails to compile with plain javac parse errors
-  (`Model.java:19: error: ';' expected` on a `given` line). With `-proc:none` it compiles.
-- **Likely cause:** annotation processing makes javac parse the sources again, through a parser
-  factory or context that forj's parser swap doesn't reach. Not investigated yet.
-- **Workaround in forj-codec:** the bench module compiles with `-proc:none` and generates
-  JMH's harness from the compiled classes with JMH's bytecode generator.
-- **Why it matters:** many real projects run annotation processors, so this blocks adopting
-  forj in them. Needs a plugin test with a trivial processor on the classpath.
+- **Cause:** not forj's parser. When a build declares annotation processors, it passes
+  `-processorpath`, and javac then loads `-Xplugin` plugins from the processor path only, not
+  the classpath. The forj plugin sat on the classpath, so it never loaded
+  (`plug-in not found: Forj`), and every forj file failed to parse.
+- **Fix:** `ForjModule` overrides `annotationProcessorsResolvedMvnDeps`. When a module has
+  processors, it adds the forj plugin to the processor path. This is in forj's `build.mill` and
+  in the downstream recipe (README, "Using forj from another build"), and `bin/check-publish`
+  compiles forj syntax next to JMH's processor to keep it fixed.
+- **Downstream:** copy the new `annotationProcessorsResolvedMvnDeps` into the library's
+  `ForjModule`. forj-codec can then drop `-proc:none` and its bytecode-generator workaround,
+  and use JMH's processor directly.
 
 ## Generated code can be shadowed by locals named like a package
 
-**Status:** open, found 2026-10-06.
+**Status:** fixed 2026-10-22 (found 2026-10-06).
 
-- The resolver inserts fully qualified references, such as `forj.json.Codec.list(...)`. A local
-  variable named `forj` (`byte[] forj = Json.encode(user);`) shadows the `forj` package, so
-  the inserted reference fails with `cannot find symbol: variable json, location: variable
-  forj`.
-- **Fix:** build the inserted references from symbols (`make.QualIdent(sym)` or equivalent)
-  rather than from dotted names, so name lookup can't capture them.
+- **Symptom:** the plugin generates fully qualified references (`forj.For.forjFlatMap(...)`,
+  `forj.Syntax.map(...)`, `lib.Ords.integer`). A variable named like the first package
+  (`byte[] forj = ...;`, `int lib = 1;`) captured them: `cannot find symbol`,
+  `int cannot be dereferenced`, or, inside a generic call, a javac crash in `TransTypes`.
+- **Why not symbols:** attaching symbols (`make.QualIdent`) isn't enough. javac re-type-checks
+  some arguments on its own copies of the tree, and its copier drops symbols, so the copy is
+  captured again.
+- **Fix:** where such a variable is actually in scope, the reference goes through a cast:
+  `((forj.Syntax) null).map(...)`. A cast's type is resolved as a type, which a variable never
+  hides, and a static member can be called through it. Otherwise references stay plain dotted
+  names.
+  - The `Desugarer` records the `forj` identifiers it generates, so the resolver rewrites only
+    those, never user code.
+  - Covered by `ShadowingTest`: a given, an extension call, a comprehension and a lifted
+    receiver.
+- **Remaining cost:** in that shadowed case only, `-Xlint:static` warns about a static member
+  accessed through an expression.
+
+## Found while building forj-http (2026-10-22)
+
+**Status:** open. Each one has a workaround in forj-http (`server/http`), noted below.
+
+- **A nested type that redeclares `F<_>` crashes the rewriter.** In `class Outer<F<_>>`, a
+  nested `interface Inner<F<_>> { F<String> run(); }` throws
+  `IndexOutOfBoundsException: Range [86, 84)` from `SourceRewriter.apply` (overlapping
+  edits, apparently one per `F<_>` in scope). Shadowing a type parameter is legal Java.
+  - Repro: those 5 lines alone, compiled with `-Xplugin:Forj`. Naming it `G<_>` compiles.
+  - Workaround: forj-http's nested types use `G<_>` (`Route.Endpoint`, `Routes.Node`).
+- **`using` after a varargs parameter:** `of(Route<F>... routes)(using Applicative<F> ap)`
+  is "varargs parameter must be the last parameter", because the clause is appended after
+  it. Either allow it (pass the instances before the varargs in the rewritten call) or
+  report a `forj:` error saying it isn't supported.
+- **Instance methods: the receiver's type arguments aren't substituted.** For
+  `routes.orNotFound()` with `Routes<IO> routes` and
+  `HttpApp<F> orNotFound()(using Applicative<F> ap)` declared in `Routes<F<_>>`, the
+  resolver looks for `Applicative<F>` (the class's own variable) and reports
+  `forj: no given forj.typeclass.Applicative<F>`, while javac knows it needs
+  `Applicative<IO>`. Likely fix: in `inferTypeArguments`, when the call is `recv.m(...)` on
+  an instance method, speculate `recv`'s type and bind the owner class's type variables from
+  `types.asSuper(recvType, method.owner)` before unifying the arguments.
+  - Workaround: forj-http's app constructor is static, `HttpApp.of(routes)(using
+    Applicative<F>)`, which infers `F` from the argument.
+- **Arguments that leave `F` unconstrained win over the target.** `Routes<IO> r =
+  Routes.of(GET(p).respond(...))(using Applicative<F>)`, where `respond` is
+  `<F<_>> Route<F> respond(...)`: speculating the argument alone gives `Route<Object>`, so
+  `F = Object` and resolution fails, although the typed local says `IO`. Binding to `Object`
+  from an argument whose own type variable was unconstrained should yield to the target.
+  - Workaround: `Routes.of` takes no `using` at all; javac infers `F` from the target.
 
 ## Enforce a coding style (2-space indentation)
 
@@ -257,15 +309,10 @@ retroactive instances. These are the gaps, most valuable first.
      - not in expression lambdas;
      - not for methods without `using` parameters;
      - not for arguments of unknown type (implicit lambdas);
-     - **bug (found 2026-10-22 in forj-codec):** `liftResults` also rewrites calls whose
-       return type is a bare type variable, not `Kind<F, A>`. With the import,
-       `List<String> xs = Json.decode(bytes);` (where `decode` is
-       `<A> A decode(byte[])(using Codec<A>, JsonBackend)`) infers
-       `A = Kind<List, String>` and fails with
-       `forj: no given forj.json.Codec<forj.Kind<java.util.List,java.lang.String>> for decode`.
-       Same for `Optional<String>`. It should only apply when the method's declared return
-       type is `F<A>`/`Kind<F, A>` with `F` a type parameter being inferred. forj-codec keeps
-       its `liftResults` test in a separate file until this is fixed (`LiftedResultsTest`).
+     - fixed 2026-10-22 (`57970c9`): `liftResults` used to rewrite calls returning a bare
+       type variable too (`List<String> xs = Json.decode(bytes);` inferred
+       `A = Kind<List, String>`). forj-codec's `ForjApiTest` now covers both cases in one
+       lifted file.
    - a "most specific instance wins" rule if a type ever gets two instances on one ladder.
 3. **Extension syntax.** Done: `extension` methods and `forj.Syntax` (`fa.map(f)`,
    `a.combine(b)`, ...). Follow-ups:

@@ -253,9 +253,28 @@ Differences from Scala 3:
 
   It's closer to a scoped implicit conversion into `Kind` than to anything cats does. The Java
   guide lists where it applies and its caveats.
+- Overloads that take `using` parameters are told apart by their ordinary arguments only;
+  there's no "most specific" ranking, so two overloads that both fit are ambiguous.
 - Type parameters that only appear in `using` parameters can't be inferred from the call;
   pass them explicitly (`Owner.<Integer>empty()`).
 - `using` methods are found when declared in sources being compiled or in imported classes.
+
+## `derives`
+
+`record User(long id, String name) derives Codec, Show { }` works like Scala 3's `derives`:
+- it adds `given`s named after the type classes (`User.codec`);
+- a generic record gets a given method taking `using X<A>` per type parameter.
+
+There's no `Mirror`. Instead the type class follows a naming convention:
+- **`product`/`field`** (required): `X.product(constructor, X.field(name, getter)...)`, with each
+  field's instance resolved by the usual given search.
+- **`deriveProduct`/`deriveField`** (optional): forj also generates the encoder as straight-line
+  `X.deriveField(out, i, value.c())` calls, and javac's overloading picks a specialization per
+  component type. It's roughly what an inline-macro derivation gives you in Scala, without
+  macros.
+
+Limits: records only; the specialized form only for non-generic records; no self-recursive
+records yet; no sealed sums yet.
 
 ## Things Scala does that forj doesn't (yet)
 

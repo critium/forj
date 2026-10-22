@@ -105,6 +105,13 @@ trait ForjModule extends ForjJava {
   def javacOptions = Task {
     withFlags(super.javacOptions(), Seq(if (forjDebug()) "-Xplugin:Forj debug" else "-Xplugin:Forj"))
   }
+
+  // With annotation processors, javac loads plugins from the processor path only, not the
+  // classpath, so the plugin goes there too (otherwise: "plug-in not found: Forj").
+  def annotationProcessorsResolvedMvnDeps = Task {
+    val processors = super.annotationProcessorsResolvedMvnDeps()
+    if (processors.isEmpty) processors else processors ++ Seq(plugin.compile().classes) ++ plugin.resources()
+  }
 }
 
 object examples extends ForjModule {

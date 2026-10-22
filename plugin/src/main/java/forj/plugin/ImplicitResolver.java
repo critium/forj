@@ -129,6 +129,22 @@ final class ImplicitResolver {
     private static final String LIFT_RECEIVERS = "liftReceivers";
     private static final String LIFT_ARGUMENTS = "liftArguments";
     private final Map<JCCompilationUnit, Set<String>> features = new HashMap<>();
+    private final Map<JCCompilationUnit, Set<Name>> variableNames = new HashMap<>();
+
+    /** Every variable, parameter and field name declared in a file: the names that could shadow a package. */
+    private Set<Name> variableNames(JCCompilationUnit unit) {
+        return variableNames.computeIfAbsent(unit, u -> {
+            Set<Name> found = new java.util.HashSet<>();
+            new com.sun.tools.javac.tree.TreeScanner() {
+                @Override
+                public void visitVarDef(JCVariableDecl tree) {
+                    found.add(tree.name);
+                    super.visitVarDef(tree);
+                }
+            }.scan(u);
+            return found;
+        });
+    }
 
     /** The forj.Language features a file imports; {@code lifting} and {@code *} mean all three. */
     private Set<String> features(JCCompilationUnit unit) {
@@ -149,8 +165,19 @@ final class ImplicitResolver {
         });
     }
 
+    /** Givens the deriver added, not yet looked at: see {@link #specializeDerivations}. */
+    private final List<Deriver.Derivation> derivations;
+    private final com.sun.tools.javac.comp.Enter enter;
+
+    /** The {@code forj} identifiers the desugarer generated ({@code forj.For.forjFlatMap}); see {@code unshadow}. */
+    private final Set<JCTree.JCIdent> generatedQualifiers;
+
     ImplicitResolver(Context context, Trees trees, javax.lang.model.util.Elements elements,
-                     ClassSymbol givenAnnotation, ClassSymbol usingAnnotation) {
+                     ClassSymbol givenAnnotation, ClassSymbol usingAnnotation, Set<JCTree.JCIdent> generatedQualifiers,
+                     List<Deriver.Derivation> derivations) {
+        this.generatedQualifiers = generatedQualifiers;
+        this.derivations = derivations;
+        this.enter = com.sun.tools.javac.comp.Enter.instance(context);
         this.elements = elements;
         this.trees = trees;
         this.attr = Attr.instance(context);
@@ -211,6 +238,7 @@ final class ImplicitResolver {
             return;
         }
         indexImports(unit);
+        specializeDerivations();
         // A call can only be resolved once its arguments' types are known, and inside a lambda
         // those can depend on resolving the enclosing call first (nested comprehensions), and
         // resolving a step lets the next pass write out its type arguments. So: passes until
@@ -229,6 +257,95 @@ final class ImplicitResolver {
         }
     }
 
+    /**
+     * derives, specialized: for each derived given whose record javac has entered, if the type
+     * class declares {@code deriveProduct} and {@code deriveField}, replace
+     * {@code X.<R>product(ctor, fields...)} with
+     * {@code X.<R>deriveProduct(ctor, (Out out, R value) -> { X.deriveField(out, 0, value.c0()); ... }, fields...)}.
+     * {@code Out} comes from {@code deriveProduct}'s encoder parameter, so forj never names a
+     * type of the library; javac's overload resolution picks each component's {@code deriveField}.
+     */
+    private void specializeDerivations() {
+        for (var it = derivations.iterator(); it.hasNext(); ) {
+            Deriver.Derivation d = it.next();
+            if (d.record().sym == null) {
+                continue;   // not entered yet: its own class comes later
+            }
+            it.remove();
+            try {
+                specialize(d);
+            } catch (RuntimeException e) {
+                trace("derives: not specializing " + d.record().name + ": " + e);
+            }
+        }
+    }
+
+    private void specialize(Deriver.Derivation d) {
+        var recordSym = (ClassSymbol) d.record().sym;
+        Env<AttrContext> env = enter.getEnv(recordSym);
+        if (env == null || !(d.field().init instanceof JCMethodInvocation product)) {
+            return;
+        }
+        Type typeClass = attribTypeQuietly(d.typeClass(), env);
+        if (typeClass == null || !(typeClass.tsym instanceof ClassSymbol x)) {
+            return;
+        }
+        indexMembers(x);
+        MethodSymbol deriveProduct = null;
+        boolean hasDeriveField = false;
+        for (Symbol s : x.members().getSymbols()) {
+            if (s instanceof MethodSymbol m && (m.flags() & Flags.STATIC) != 0) {
+                if (m.name.contentEquals("deriveProduct") && m.params().size() >= 2) {
+                    deriveProduct = m;
+                }
+                hasDeriveField |= m.name.contentEquals("deriveField");
+            }
+        }
+        if (deriveProduct == null || !hasDeriveField || deriveProduct.type.getTypeArguments().size() != 1) {
+            return;
+        }
+        // the encoder parameter's functional type, with deriveProduct's T as the record: (Out, R) -> ...
+        Type encoderType = types.subst(deriveProduct.type.getParameterTypes().get(1),
+                deriveProduct.type.getTypeArguments(), com.sun.tools.javac.util.List.of(recordSym.type));
+        List<Type> inputs = descriptorInputs(encoderType);
+        if (inputs == null || inputs.size() != 2) {
+            return;
+        }
+        make.at(d.encoderPos());
+        Name out = names.fromString("out");
+        Name value = names.fromString("value");
+        ListBuffer<JCTree.JCStatement> body = new ListBuffer<>();
+        for (int i = 0; i < d.components().size(); i++) {
+            body.append(make.Exec(make.Apply(com.sun.tools.javac.util.List.nil(),
+                    make.Select(new TreeCopier<Void>(make).copy(d.typeClass()), names.fromString("deriveField")),
+                    com.sun.tools.javac.util.List.of(make.Ident(out), make.Literal(com.sun.tools.javac.code.TypeTag.INT, i),
+                            make.Apply(com.sun.tools.javac.util.List.nil(),
+                                    make.Select(make.Ident(value), d.components().get(i).name),
+                                    com.sun.tools.javac.util.List.nil())))));
+        }
+        JCLambda encoder = make.Lambda(com.sun.tools.javac.util.List.of(
+                        make.VarDef(make.Modifiers(Flags.PARAMETER), out, typeTree(inputs.get(0)), null),
+                        make.VarDef(make.Modifiers(Flags.PARAMETER), value, typeTree(inputs.get(1)), null)),
+                make.Block(0, body.toList()));
+        encoder.pos = d.encoderPos();
+        product.meth = make.Select(new TreeCopier<Void>(make).copy(d.typeClass()), deriveProduct.name);
+        product.args = product.args.tail.prepend(encoder).prepend(product.args.head);
+        trace("derives: specialized " + d.record().name + " for " + x + ": " + product);
+    }
+
+    private Type attribTypeQuietly(JCExpression tree, Env<AttrContext> env) {
+        JCTree copy = new TreeCopier<Void>(make).copy(tree);
+        Object saved = swapArgumentCache(new HashMap<>());
+        Log.DiagnosticHandler discard = log.new DiscardDiagnosticHandler();
+        try {
+            Type t = attr.attribType(copy, env.dup(copy));
+            return t == null || t.isErroneous() ? null : t;
+        } finally {
+            log.popDiagnosticHandler(discard);
+            swapArgumentCache(saved);
+        }
+    }
+
     /** One pass over a class; returns {resolved, pending}. */
     private int[] pass(JCCompilationUnit unit, TreePath classPath, boolean report) {
         int[] counts = {0, 0};
@@ -237,6 +354,11 @@ final class ImplicitResolver {
             public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
                 super.visitMethodInvocation(node, unused); // innermost calls first
                 var call = (JCMethodInvocation) node;
+                if (call.meth instanceof JCFieldAccess outer && outer.selected instanceof JCFieldAccess inner
+                        && inner.selected instanceof JCTree.JCIdent root && generatedQualifiers.remove(root)
+                        && variableNames(unit).contains(root.name)) {
+                    new CallSite(unit, getCurrentPath(), call).unshadow(outer, inner);
+                }
                 Name name = TreeInfo.name(call.meth);
                 Outcome outcome = Outcome.SKIPPED;
                 if (name == forjLower && call.args.size() == 1) {
@@ -439,6 +561,66 @@ final class ImplicitResolver {
             return Outcome.RESOLVED;
         }
 
+        /**
+         * An expression for the class {@code c}, to call its static members on. Normally its full
+         * name ({@code lib.Ords}). When a variable in scope has the name of the first package
+         * ({@code int lib = 1;}), that name would mean the variable, so the class is reached
+         * through a cast instead, {@code ((lib.Ords) null)}: a cast's type is resolved as a type,
+         * which a variable never hides, and a static member can be called through it.
+         */
+        private JCExpression owner(ClassSymbol c) {
+            JCExpression name = qualified(c);
+            if (!(name instanceof JCFieldAccess)) {
+                return name;   // a top-level class in the unnamed package: no package to shadow
+            }
+            Name root = TreeInfo.name(rootOf(name));
+            if (!variableNames(unit).contains(root) || !shadowed(root)) {
+                return name;
+            }
+            return castedNull(name);
+        }
+
+        private JCExpression castedNull(JCExpression type) {
+            return make.Parens(make.TypeCast(type, make.Literal(com.sun.tools.javac.code.TypeTag.BOT, null)));
+        }
+
+        private static boolean isCastedNull(JCExpression e) {
+            return e instanceof JCTree.JCParens p && p.expr instanceof JCTree.JCTypeCast cast
+                    && cast.expr instanceof JCTree.JCLiteral literal && literal.typetag == com.sun.tools.javac.code.TypeTag.BOT;
+        }
+
+        private static JCExpression rootOf(JCExpression e) {
+            while (e instanceof JCFieldAccess f) {
+                e = f.selected;
+            }
+            return e;
+        }
+
+        /** Does {@code name} mean a variable here (a local, a parameter or a field)? */
+        private boolean shadowed(Name name) {
+            JCTree.JCIdent ident = make.Ident(name);
+            Env<AttrContext> scratch = env.dup(ident);
+            Object saved = swapArgumentCache(new HashMap<>());
+            Log.DiagnosticHandler discard = log.new DiscardDiagnosticHandler();
+            try {
+                attr.attribExpr(ident, scratch);
+            } catch (RuntimeException e) {
+                return false;
+            } finally {
+                log.popDiagnosticHandler(discard);
+                swapArgumentCache(saved);
+            }
+            return ident.sym != null && ident.sym.kind == Kind.VAR;
+        }
+
+        /** The desugarer's {@code forj.For.m(...)} where {@code forj} means a variable here: call it through a cast. */
+        void unshadow(JCFieldAccess outer, JCFieldAccess forjFor) {
+            if (shadowed(((JCTree.JCIdent) forjFor.selected).name)) {
+                make.at(outer.pos);
+                outer.selected = castedNull(forjFor);
+            }
+        }
+
         private boolean enabled(String feature) {
             return features(unit).contains(feature);
         }
@@ -510,7 +692,7 @@ final class ImplicitResolver {
                 typeArgs.append(typeTree(bound));
             }
             make.at(expr.pos);
-            return make.Apply(typeArgs.toList(), make.Select(qualified((ClassSymbol) found.owner), found.name),
+            return make.Apply(typeArgs.toList(), make.Select(owner((ClassSymbol) found.owner), found.name),
                     com.sun.tools.javac.util.List.of(expr));
         }
 
@@ -588,8 +770,8 @@ final class ImplicitResolver {
             this.report = report;
             var select = (JCFieldAccess) call.meth;
             Name name = select.name;
-            if (call.typeargs.nonEmpty()) {
-                return Outcome.SKIPPED;
+            if (call.typeargs.nonEmpty() || isCastedNull(select.selected)) {
+                return Outcome.SKIPPED;   // ((Owner) null).m(...) is a static call this resolver made
             }
             Type receiver = speculate(select.selected, false);
             if (receiver == null || receiver.isErroneous()) {
@@ -628,7 +810,7 @@ final class ImplicitResolver {
                     MethodSymbol m = fits.getFirst();
                     indexMembers((ClassSymbol) m.owner);   // its using parameters, if from a library
                     make.at(select.pos);
-                    call.meth = make.Select(qualified((ClassSymbol) m.owner), name);
+                    call.meth = make.Select(owner((ClassSymbol) m.owner), name);
                     call.args = call.args.prepend(lifted ? liftedReceiver : select.selected);
                     return Outcome.RESOLVED;
                 }
@@ -723,7 +905,7 @@ final class ImplicitResolver {
                 return Outcome.SKIPPED;
             }
             make.at(call.meth.pos);
-            call.meth = make.Select(qualified(forClass), names.fromString("forjKind"));
+            call.meth = make.Select(owner(forClass), names.fromString("forjKind"));
             return Outcome.RESOLVED;
         }
 
@@ -744,7 +926,7 @@ final class ImplicitResolver {
             }
             make.at(call.meth.pos);
             JCExpression wrapped = make.Apply(com.sun.tools.javac.util.List.nil(),
-                    make.Select(qualified(forClass), names.fromString("forjNarrow")),
+                    make.Select(owner(forClass), names.fromString("forjNarrow")),
                     com.sun.tools.javac.util.List.of(call));
             Lowering lowering = enabled(LIFT_RESULTS) ? lowering(targetType()) : null;
             if (lowering != null) {
@@ -755,7 +937,7 @@ final class ImplicitResolver {
                 }
                 make.at(call.meth.pos);
                 wrapped = make.Apply(typeArgs.toList(),
-                        make.Select(qualified((ClassSymbol) lowering.method().owner), lowering.method().name),
+                        make.Select(owner((ClassSymbol) lowering.method().owner), lowering.method().name),
                         com.sun.tools.javac.util.List.of(call));
             }
             switch (path.getParentPath().getLeaf()) {
@@ -886,7 +1068,7 @@ final class ImplicitResolver {
                     if (param != null && param.getTypeArguments().nonEmpty()
                             && types.isSameType(types.erasure(param.getTypeArguments().head), types.erasure(witness))) {
                         make.at(call.meth.pos);
-                        call.meth = make.Select(qualified((ClassSymbol) m.owner), m.name);
+                        call.meth = make.Select(owner((ClassSymbol) m.owner), m.name);
                         return Outcome.RESOLVED;
                     }
                 }
@@ -1106,7 +1288,7 @@ final class ImplicitResolver {
                     if (v.owner.kind == Kind.MTH) {
                         return make.Ident(v.name); // a using parameter of the enclosing method
                     }
-                    return make.Select(qualified((ClassSymbol) v.owner), v.name);
+                    return make.Select(owner((ClassSymbol) v.owner), v.name);
                 }
                 MethodSymbol m = (MethodSymbol) candidate;
                 List<Type> tvars = m.type.getTypeArguments();
@@ -1139,7 +1321,7 @@ final class ImplicitResolver {
                 }
                 make.at(call.pos);
                 return make.Apply(typeArgs.toList(),
-                        make.Select(qualified((ClassSymbol) m.owner), m.name), args.toList());
+                        make.Select(owner((ClassSymbol) m.owner), m.name), args.toList());
             }
 
             /** Candidate givens, nearest scope first. */

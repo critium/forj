@@ -94,6 +94,7 @@ final class SourceRewriter {
     private static final String GIVEN = "given";
     private static final String USING = "using";
     private static final String EXTENSION = "extension";
+    private static final String DERIVES = "derives";
     private static final String GIVEN_ANNOTATION = "@forj.Given ";
     private static final String EXTENSION_ANNOTATION = "@forj.Extension ";
     private static final String USING_ANNOTATION = "@forj.Using ";
@@ -104,7 +105,7 @@ final class SourceRewriter {
         String text = input.toString();
         boolean interpolates = Interpolations.mayContain(text);
         if (!interpolates && !text.contains("<-") && !text.contains(FORJ) && !text.contains(GIVEN)
-                && !text.contains(USING) && !text.contains(EXTENSION) && !text.contains("<_>")) {
+                && !text.contains(USING) && !text.contains(EXTENSION) && !text.contains(DERIVES) && !text.contains("<_>")) {
             return null;
         }
         List<Token> tokens = tokenize(text, scanners, log);
@@ -126,6 +127,7 @@ final class SourceRewriter {
         findGivens(tokens, edits);
         findUsings(tokens, edits);
         findHigherKinds(tokens, edits);
+        findDerives(tokens, edits);
         return edits.isEmpty() ? null : apply(text, edits);
     }
 
@@ -300,6 +302,73 @@ final class SourceRewriter {
                 edits.add(new Edit(t.pos, t.endPos, EXTENSION_ANNOTATION + (hasAccess ? "" : "public ") + "static", 0, Kind.TEXT));
             }
         }
+    }
+
+    // ------------------------------------------------- record R(...) derives X, Y { }
+
+    /**
+     * {@code record User(long id, String name) derives Codec, Show {} } becomes
+     * {@code @forj.Derives({Codec.class, Show.class}) record User(long id, String name) {} }:
+     * the clause is dropped and the type classes move into the annotation the deriver reads.
+     */
+    private static void findDerives(List<Token> tokens, List<Edit> edits) {
+        for (int i = 1; i + 1 < tokens.size(); i++) {
+            Token t = tokens.get(i);
+            if (!isName(t, DERIVES) || tokens.get(i + 1).kind != TokenKind.IDENTIFIER) {
+                continue;
+            }
+            int record = recordKeywordBefore(tokens, i);
+            if (record < 0) {
+                continue;
+            }
+            List<String> classes = new ArrayList<>();
+            StringBuilder name = new StringBuilder();
+            int j = i + 1;
+            for (; j < tokens.size(); j++) {
+                Token n = tokens.get(j);
+                if (n.kind == TokenKind.IDENTIFIER) {
+                    name.append(n.name());
+                } else if (n.kind == TokenKind.DOT) {
+                    name.append('.');
+                } else if (n.kind == TokenKind.COMMA || n.kind == TokenKind.LBRACE) {
+                    classes.add(name + ".class");
+                    name.setLength(0);
+                    if (n.kind == TokenKind.LBRACE) {
+                        break;
+                    }
+                } else {
+                    j = -1;   // not a list of type names: leave it to javac
+                    break;
+                }
+            }
+            if (j < 0 || j >= tokens.size() || classes.isEmpty()) {
+                continue;
+            }
+            Token keyword = tokens.get(record);
+            edits.add(new Edit(keyword.pos, keyword.pos,
+                    "@forj.Derives({" + String.join(", ", classes) + "}) ", 0, Kind.TEXT));
+            edits.add(new Edit(t.pos, tokens.get(j).pos, "", 0, Kind.TEXT));
+        }
+    }
+
+    /** The {@code record} keyword whose header contains index {@code i}, or -1. */
+    private static int recordKeywordBefore(List<Token> tokens, int i) {
+        for (int j = i - 1; j >= 1; j--) {
+            Token t = tokens.get(j);
+            switch (t.kind) {
+                case SEMI, LBRACE, RBRACE -> {
+                    return -1;
+                }
+                default -> {
+                    if (isName(t, "record") && j + 2 < tokens.size()
+                            && tokens.get(j + 1).kind == TokenKind.IDENTIFIER
+                            && (tokens.get(j + 2).kind == TokenKind.LPAREN || tokens.get(j + 2).kind == TokenKind.LT)) {
+                        return j;
+                    }
+                }
+            }
+        }
+        return -1;
     }
 
     /** At a declaration boundary, optionally after an access modifier. */

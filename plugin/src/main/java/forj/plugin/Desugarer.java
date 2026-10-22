@@ -74,7 +74,17 @@ final class Desugarer extends TreeTranslator {
     private boolean rewrote;
     private int fresh;
 
-    Desugarer(Context context, Trees trees, JCCompilationUnit unit, SourceRewriter.Result rewrite, boolean debug) {
+    /**
+     * The {@code forj} identifiers this desugarer generates ({@code forj.For.forjFlatMap}). If a
+     * variable named {@code forj} is in scope where one ends up, {@link ImplicitResolver} calls
+     * through {@code ((forj.For) null)} instead; it can tell generated names from ones the user
+     * wrote by this set.
+     */
+    private final java.util.Set<JCTree.JCIdent> generatedQualifiers;
+
+    Desugarer(Context context, Trees trees, JCCompilationUnit unit, SourceRewriter.Result rewrite, boolean debug,
+              java.util.Set<JCTree.JCIdent> generatedQualifiers) {
+        this.generatedQualifiers = generatedQualifiers;
         this.make = TreeMaker.instance(context);
         this.names = Names.instance(context);
         this.trees = trees;
@@ -142,7 +152,7 @@ final class Desugarer extends TreeTranslator {
             result = ret.expr;
         } else {
             make.at(call.meth.pos);
-            call.meth = make.Select(make.Select(make.Ident(forjPkg), forClass), run);
+            call.meth = make.Select(make.Select(forjIdent(), forClass), run);
             result = call;
         }
 
@@ -217,8 +227,15 @@ final class Desugarer extends TreeTranslator {
      * parameter, passed by the implicit resolver once javac knows {@code fa}'s type.
      */
     private JCMethodInvocation call(Name method, JCExpression monad, JCLambda fn) {
-        return make.Apply(List.nil(), make.Select(make.Select(make.Ident(forjPkg), forClass), method),
+        return make.Apply(List.nil(), make.Select(make.Select(forjIdent(), forClass), method),
                 List.of(monad, fn));
+    }
+
+    /** A generated {@code forj} package identifier, recorded so the resolver can bind it. */
+    private JCTree.JCIdent forjIdent() {
+        JCTree.JCIdent ident = make.Ident(forjPkg);
+        generatedQualifiers.add(ident);
+        return ident;
     }
 
     /** The comprehension's value goes back from {@code Kind<F, A>} to the type it stands for. */

@@ -450,6 +450,54 @@ final class Report {
 To get an instance directly: `Implicits.<Show<Integer>>summon()`. Instances in compiled
 libraries are found too.
 
+## Deriving instances: `derives`
+
+A record can ask for type class instances instead of writing them by hand:
+
+```java
+record User(long id, String name, Instant joined) derives Codec, Show { }
+
+Codec<User> c = User.codec;     // a given named after the type class
+```
+
+For each type class, the record gets a `given` (`User.codec`, `User.show`) built from its
+components. Each component's instance is resolved like any `using` argument, so givens in scope
+apply to it: a `given Codec<Instant>` with a custom format in an enclosing class wins over the
+default. A record that contains another derived record uses that record's given. A component
+without an instance is a compile error naming the missing one:
+`forj: no given forj.json.Codec<java.time.Instant>`.
+
+- **Generic records** get a given *method*: `record Box<A>(A value) derives Codec` gives
+  `<A> Codec<Box<A>> codec(using Codec<A>)`, so `Codec<Box<String>>` is found whenever
+  `Codec<String>` is.
+- **Plain Java:** `@forj.Derives({Codec.class, Show.class}) record User(...) { }` is the same
+  thing, and parses in any editor.
+- **The clause** goes after the components and any `implements`:
+  `record Point(int x, int y) implements Comparable<Point> derives Show { ... }`.
+
+### What a type class provides
+
+forj knows nothing about JSON or text. It only uses a naming convention on the type class
+named in `derives X` (found through your imports like any name):
+
+| Convention | Required | What forj generates |
+|---|---|---|
+| `static <T, F> ... field(String name, Function<T, F> getter)(using X<F>)` and `static <T> X<T> product(Function<Object[], T> constructor, ...fields)` | yes | `X.<User>product((Object[] a) -> new User((long) a[0], ...), X.<User, Long>field("id", (User r) -> r.id()), ...)` |
+| `static <T> X<T> deriveProduct(constructor, encoder, ...fields)` plus `deriveField(out, index, value)` overloads | optional | the encoder as straight-line code: `X.deriveField(out, 0, u.id()); X.deriveField(out, 1, u.name()); ...` |
+
+The second form is for speed. javac's overload resolution picks the `deriveField` for each
+component's type, so a library can offer `deriveField(Out, int, long)` and `deriveField(Out, int,
+String)` (no boxing, no loop, no function objects) plus one generic
+`<A> deriveField(Out, int, A)(using X<A>)` for everything else. `Out` is whatever type the
+library's encoder takes; forj reads it from `deriveProduct`'s signature. A type class without
+`deriveProduct` just gets the first form.
+
+Limits for now:
+- only records;
+- the specialized form is for non-generic records (generic ones use `product`);
+- a record that contains itself (`record Tree(List<Tree> kids)`) isn't supported yet, because
+  its given would read itself while it's still being built.
+
 ## Extension methods
 
 `extension` declares a static method you can call as if it were a method of its first
@@ -598,6 +646,16 @@ Compared with Java's `ScopedValue`, which does a similar job at runtime:
   means what it always means.
 - **Editors show red.** IntelliJ and VS Code don't know the syntax yet, so they flag it.
   The Mill build is the source of truth.
+- **Overloads with `using` parameters are picked by their ordinary arguments.**
+  `decode(byte[])(using Codec<A>)` next to `decode(InputStream)(using Codec<A>)` is fine.
+  Two overloads that both accept the arguments are still ambiguous: forj doesn't rank the more
+  specific one, and an argument whose type isn't known yet (an implicit lambda) accepts either.
+- **A local named like a package** (`byte[] forj = ...;`) doesn't break generated code: where
+  one is in scope, forj calls through `((forj.Syntax) null).map(...)` instead of
+  `forj.Syntax.map(...)`. With `-Xlint:static`, javac warns about that call.
+- **With annotation processors** (Lombok, JMH, MapStruct, ...), the build must put the forj
+  plugin on the processor path too, or javac reports `plug-in not found: Forj`. The
+  `ForjModule` in the README ("Using forj from another build") does that.
 
 ## Error messages
 

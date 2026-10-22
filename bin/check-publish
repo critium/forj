@@ -34,9 +34,23 @@ trait ForjModule extends JavaModule {
   def compileMvnDeps = super.compileMvnDeps() ++ Seq(mvn"forj:forj-plugin:0.1.0-SNAPSHOT")
   def jvmOptions = super.jvmOptions() ++ forjCompilerJvmOptions
   def javacOptions = super.javacOptions() ++ Seq("--enable-preview", "--source", "28", "-Xplugin:Forj")
+  // With annotation processors (JMH, Lombok, ...), javac loads plugins from the processor
+  // path only, not the classpath, so the forj plugin goes there too (otherwise:
+  // "plug-in not found: Forj").
+  def annotationProcessorsResolvedMvnDeps = Task {
+    val processors = super.annotationProcessorsResolvedMvnDeps()
+    if (processors.isEmpty) processors
+    else processors ++ compileClasspath().filter(_.path.last.startsWith("forj-plugin-"))
+  }
 }
 
 object app extends ForjModule
+
+/** forj syntax next to an annotation processor (JMH's), which once kept the plugin from loading. */
+object withProcessor extends ForjModule {
+  def mvnDeps = super.mvnDeps() ++ Seq(mvn"org.openjdk.jmh:jmh-core:1.37")
+  def annotationProcessorsMvnDeps = Seq(mvn"org.openjdk.jmh:jmh-generator-annprocess:1.37")
+}
 EOF
 
 cat > "$WORK/app/src/app/Show.java" <<'EOF'
@@ -76,6 +90,26 @@ public class Main {
 }
 EOF
 
+mkdir -p "$WORK/withProcessor/src/bench"
+cat > "$WORK/withProcessor/src/bench/Bench.java" <<'JAVA'
+package bench;
+
+import org.openjdk.jmh.annotations.Benchmark;
+
+public class Bench {
+    interface Show<A> {
+        String show(A a);
+    }
+
+    given Show<Integer> integer = i -> "#" + i;
+
+    @Benchmark
+    public String show() {
+        return integer.show(1);
+    }
+}
+JAVA
+
 expected="sum=3 shown=#7 twice=#3#3 combined=12"
 cd "$WORK"
 if ! output="$(./mill --no-server app.run 2>&1)"; then
@@ -88,4 +122,13 @@ if ! grep -qxF "$expected" <<<"$output"; then
   echo "check-publish: expected '$expected'" >&2
   exit 1
 fi
-echo "check-publish: ok ($expected)"
+if ! output="$(./mill --no-server withProcessor.compile 2>&1)"; then
+  echo "$output"
+  echo "check-publish: forj syntax next to an annotation processor failed to compile" >&2
+  exit 1
+fi
+if [ ! -f out/withProcessor/compile.dest/classes/META-INF/BenchmarkList ]; then
+  echo "check-publish: JMH's annotation processor didn't run" >&2
+  exit 1
+fi
+echo "check-publish: ok ($expected; also compiles next to an annotation processor)"

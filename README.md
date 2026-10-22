@@ -41,6 +41,10 @@ List.of(1, 2).show();   // with import static Show.*: Show.show(List.of(1, 2), S
 Extension methods also give the type classes cats-style syntax on any `F`, with no imports:
 `fa.map(f)`, `fa.flatMap(f)`, `fa.handleErrorWith(h)`, `fa.race(fb)`, `a.combine(b)`.
 
+Records can derive instances: `record User(long id, String name) derives Codec { }` adds a
+`given Codec<User>` built from the components, through a convention any type class can follow
+(see the Java guide, "Deriving instances").
+
 Callers can still pass an instance themselves (`Show.show(xs)(using hexShow)`). For code that
 must parse in any Java editor, `@Using`/`@Given` annotations do the same as the keywords.
 
@@ -183,6 +187,14 @@ trait ForjModule extends JavaModule {
   def compileMvnDeps = super.compileMvnDeps() ++ Seq(mvn"forj:forj-plugin:0.1.0-SNAPSHOT")
   def jvmOptions = super.jvmOptions() ++ forjCompilerJvmOptions   // pluginJvmOptions in build.mill
   def javacOptions = super.javacOptions() ++ Seq("--enable-preview", "--source", "28", "-Xplugin:Forj")
+  // With annotation processors (JMH, Lombok, ...), javac loads plugins from the processor
+  // path only, not the classpath, so the forj plugin goes there too (otherwise:
+  // "plug-in not found: Forj").
+  def annotationProcessorsResolvedMvnDeps = Task {
+    val processors = super.annotationProcessorsResolvedMvnDeps()
+    if (processors.isEmpty) processors
+    else processors ++ compileClasspath().filter(_.path.last.startsWith("forj-plugin-"))
+  }
 }
 ```
 
