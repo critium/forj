@@ -63,7 +63,8 @@ only where a file must stay parseable by plain tools.
   A real method always wins: `optional.map(f)` is `Optional.map`.
 - **`F` is inferred from context,** not only from arguments:
   - a typed local: `IO<Receipt> r = checkout(order);` gives `F = IO`;
-  - a `return`, or an assignment;
+  - a `return` (in a lambda too: the interface method's return type), or an assignment;
+  - both branches of `?:`, and parentheses;
   - the parameter the call is passed to: `app.through(errors())` on an `HttpApp<IO>`.
 
   It is *not* inferred through a generic outer call (`describe(checkout(order))`). There,
@@ -92,8 +93,8 @@ only where a file must stay parseable by plain tools.
 - Comprehensions need `Monad<F>`. Ask for the weakest capability that works:
   - `Applicative` with `map2` for independent steps;
   - `Functor` for `map` alone.
-- Two `using` overloads must differ in their ordinary parameter types. forj doesn't rank "more
-  specific" overloads.
+- `using` overloads are picked by their ordinary parameter types. When several fit, the most
+  specific wins, as in javac: `json(Request)` over `json(A)` for a `Request`.
 - For `derives X`, the type class `X` must declare:
   - static `field(String, Function<T, F>)(using X<F>)` and
     `product(Function<Object[], T>, Field...)`;

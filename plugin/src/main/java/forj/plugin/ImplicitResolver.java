@@ -444,6 +444,11 @@ final class ImplicitResolver {
                 return Outcome.SKIPPED; // none takes these arguments; javac reports it
             }
             if (candidates.size() > 1) {
+                // json(A) and json(Request) both take a Request: the more specific one wins, as in javac
+                List<MethodSymbol> all = List.copyOf(candidates);
+                candidates.removeIf(m -> all.stream().anyMatch(o -> o != m && moreSpecific(o, m) && !moreSpecific(m, o)));
+            }
+            if (candidates.size() > 1) {
                 return error(call, "ambiguous call: " + candidates.size() + " methods named " + name + " take using parameters");
             }
             MethodSymbol method = candidates.getFirst();
@@ -619,25 +624,69 @@ final class ImplicitResolver {
         }
 
         /**
-         * The type the call's value goes into, if its context says: a typed local variable, a
-         * return from the enclosing method, or an assignment. Used to infer type parameters
-         * that only the result mentions ({@code IO<Unit> app = checkout(cart);} gives F = IO).
+         * The type the call's value goes into, if its context says. Used to infer type
+         * parameters that only the result mentions ({@code IO<Unit> app = checkout(cart);} gives
+         * F = IO). See {@link #targetOf}.
          */
         Type targetType() {
-            TreePath parent = path.getParentPath();
+            return targetOf(path);
+        }
+
+        /**
+         * The type the expression at {@code at} goes into:
+         * <ul>
+         *   <li>a typed local variable, or an assignment;</li>
+         *   <li>a {@code return}: the enclosing method's return type, or in a lambda the
+         *       return type of the method its interface declares;</li>
+         *   <li>a lambda's expression body, the same way;</li>
+         *   <li>a parameter of an enclosing call ({@link #argumentTarget});</li>
+         *   <li>inside parentheses or a branch of {@code ?:}: the target of the whole.</li>
+         * </ul>
+         * A lambda's own target is found the same way, so {@code return decode(b)} in
+         * {@code return (b, h) -> ...} of a method returning {@code Decoder<A>} targets {@code A}.
+         */
+        private Type targetOf(TreePath at) {
+            TreePath parent = at.getParentPath();
+            if (parent == null) {
+                return null;
+            }
             if (parent.getLeaf() instanceof JCMethodInvocation wrapper
                     && TreeInfo.name(wrapper.meth).contentEquals("forjNarrow")) {
+                at = parent;
                 parent = parent.getParentPath();
             }
+            Tree leaf = at.getLeaf();
             return switch (parent.getLeaf()) {
-                case JCVariableDecl v when v.vartype != null && !v.declaredUsingVar() -> speculate(v.vartype, true);
-                case JCReturn r -> insideLambda(parent) || env.enclMethod == null || env.enclMethod.sym == null
-                        ? null : env.enclMethod.sym.type.getReturnType();
-                case JCAssign a -> speculate(a.lhs, false);
-                case JCMethodInvocation outer when outer.args.stream().anyMatch(arg -> arg == path.getLeaf()) ->
-                        argumentTarget(outer, (JCExpression) path.getLeaf());
+                case JCVariableDecl v when v.init == leaf && v.vartype != null && !v.declaredUsingVar() ->
+                        speculate(v.vartype, true);
+                case JCReturn r -> returnTarget(parent);
+                case JCAssign a when a.rhs == leaf -> speculate(a.lhs, false);
+                case JCTree.JCParens p -> targetOf(parent);
+                case JCTree.JCConditional c when c.cond != leaf -> targetOf(parent);
+                case JCLambda l when l.body == leaf -> lambdaResult(parent);
+                case JCMethodInvocation outer when outer.args.stream().anyMatch(arg -> arg == leaf) ->
+                        argumentTarget(outer, (JCExpression) leaf);
                 default -> null;
             };
+        }
+
+        /** What a {@code return} returns into: the nearest enclosing lambda's result, or method's. */
+        private Type returnTarget(TreePath ret) {
+            for (TreePath p = ret.getParentPath(); p != null; p = p.getParentPath()) {
+                if (p.getLeaf() instanceof JCLambda) {
+                    return lambdaResult(p);
+                }
+                if (p.getLeaf() instanceof JCMethodDecl m) {
+                    return m.sym != null ? m.sym.type.getReturnType() : null;
+                }
+            }
+            return null;
+        }
+
+        /** The return type of the method a lambda implements, when the lambda's own target is known. */
+        private Type lambdaResult(TreePath lambda) {
+            Type functional = targetOf(lambda);
+            return functional == null || functional.isErroneous() ? null : descriptorResult(functional);
         }
 
         /**
@@ -693,18 +742,6 @@ final class ImplicitResolver {
                 }
             }
             return null;
-        }
-
-        private boolean insideLambda(TreePath from) {
-            for (TreePath p = from; p != null; p = p.getParentPath()) {
-                if (p.getLeaf() instanceof JCLambda) {
-                    return true;
-                }
-                if (p.getLeaf() instanceof JCMethodDecl) {
-                    return false;
-                }
-            }
-            return false;
         }
 
         /**
@@ -821,6 +858,25 @@ final class ImplicitResolver {
                 Type param = types.erasure(declared);
                 if (arg != null && !types.isConvertible(arg, param)
                         && !(lifting && this.lifting.isKindType(param) && this.lifting.lift(call.args.get(i), arg) != null)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * Whether each of {@code m}'s ordinary parameters, at this call's arguments, fits
+         * {@code o}'s (erased, so a type variable counts as its bound): javac's "most specific
+         * method" test, without inference.
+         */
+        private boolean moreSpecific(MethodSymbol m, MethodSymbol o) {
+            for (int i = 0; i < call.args.size(); i++) {
+                Type mine = paramFor(m, i);
+                Type theirs = paramFor(o, i);
+                if (mine == null || theirs == null) {
+                    return false;
+                }
+                if (!types.isSubtype(types.erasure(mine), types.erasure(theirs))) {
                     return false;
                 }
             }
@@ -1254,8 +1310,24 @@ final class ImplicitResolver {
 
     // ------------------------------------------------------------------- types
 
+    /** Return type of a functional interface type's method (null for void), wildcards replaced by their bounds. */
+    private Type descriptorResult(Type functional) {
+        Type method = descriptorMethod(functional);
+        Type result = method == null ? null : method.getReturnType();
+        return result == null || result.hasTag(com.sun.tools.javac.code.TypeTag.VOID) ? null : result;
+    }
+
     /** Parameter types of a functional interface type's method, wildcards replaced by their bounds. */
     List<Type> descriptorInputs(Type functional) {
+        if (!(functional.tsym instanceof ClassSymbol c) || !c.isInterface()) {
+            return null;
+        }
+        Type method = descriptorMethod(functional);
+        return method == null ? null : method.getParameterTypes();
+    }
+
+    /** The method type of a functional interface type's single abstract method, or null. */
+    private Type descriptorMethod(Type functional) {
         if (!(functional.tsym instanceof ClassSymbol c) || !c.isInterface()) {
             return null;
         }
@@ -1266,7 +1338,7 @@ final class ImplicitResolver {
         Type plain = new Type.ClassType(functional.getEnclosingType(), args.toList(), c);
         try {
             Symbol descriptor = types.findDescriptorSymbol(c);
-            return types.memberType(plain, descriptor).getParameterTypes();
+            return types.memberType(plain, descriptor);
         } catch (RuntimeException e) {
             return null;
         }

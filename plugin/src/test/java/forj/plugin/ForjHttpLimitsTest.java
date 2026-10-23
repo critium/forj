@@ -169,6 +169,110 @@ class ForjHttpLimitsTest {
         assertEquals(List.of("started a", "started b"), c.call("app.App", "run"));
     }
 
+    /** forj-http's JSON bridge: a codec type class, and a request to read bodies from. */
+    static final String JSON = """
+            package lib;
+            import java.util.function.Function;
+            public final class Json {
+                public interface Codec<A> { String write(A a); A read(String s); }
+                public record Request(String body) {}
+                public record Entity(String text) {}
+                public interface Decoder<A> { A decode(String body, boolean strict); }
+                public static <A> A decode(String s)(using Codec<A> c) { return c.read(s); }
+
+                public static <A> Entity json(A value)(using Codec<A> c) { return new Entity(c.write(value)); }
+                extension <A> A json(Request request)(using Codec<A> c) { return c.read(request.body()); }
+
+                public static <A> Decoder<A> decoder()(using Codec<A> c) {
+                    return (body, strict) -> {
+                        if (strict) return decode(body.strip());
+                        return decode(body);
+                    };
+                }
+
+                public static <A> A either(String s, boolean trim)(using Codec<A> c) {
+                    A v = trim ? decode(s.strip()) : decode(s);
+                    return v;
+                }
+            }
+            """;
+
+    static final String USERS = """
+            package app;
+            import lib.Json.Codec;
+            public record User(String name) {
+                given Codec<User> codec = new Codec<>() {
+                    public String write(User u) { return "{" + u.name() + "}"; }
+                    public User read(String s) { return new User(s.replace("{", "").replace("}", "").strip()); }
+                };
+            }
+            """;
+
+    @Test
+    void aGenericOverloadAndAConcreteOneArePickedByTheirOrdinaryParameters() throws Exception {
+        var c = compile(Map.of("lib/Json.java", JSON, "app/User.java", USERS, "app/App.java", """
+                package app;
+                import static lib.Json.*;
+                import java.util.List;
+                import lib.Json.Request;
+                public class App {
+                    public static Object run() {
+                        Entity e = json(new User("ana"));            // only json(A) takes a User
+                        User u = new Request("{bo}").json();          // the extension on Request
+                        User v = json(new Request("{cy}"));           // both fit: the more specific json(Request)
+                        return List.of(e.text(), u.name(), v.name());
+                    }
+                }
+                """));
+        assertEquals(List.of("{ana}", "bo", "cy"), c.call("app.App", "run"));
+    }
+
+    @Test
+    void aReturnInALambdaAndBothBranchesOfAConditionalGetTheirTarget() throws Exception {
+        var c = compile(Map.of("lib/Json.java", JSON, "app/User.java", USERS, "app/App.java", """
+                package app;
+                import java.util.List;
+                import lib.Json;
+                public class App {
+                    public static Object run() {
+                        Json.Decoder<User> d = Json.decoder();
+                        User a = Json.either(" {ana} ", true);
+                        return List.of(d.decode(" {bo} ", true).name(), d.decode("{cy}", false).name(), a.name());
+                    }
+                }
+                """));
+        assertEquals(List.of("bo", "cy", "ana"), c.call("app.App", "run"));
+    }
+
+    @Test
+    void extensionsAndGivensCanBeAnnotated() throws Exception {
+        var c = compile(Map.of("lib/Shout.java", """
+                package lib;
+                public final class Shout {
+                    public interface Show<A> { String show(A a); }
+                    @Deprecated(forRemoval = true)
+                    extension <A> String shout(A a)(using Show<A> s) { return s.show(a).toUpperCase(); }
+                    @SuppressWarnings("unused") @java.lang.Deprecated
+                    given Show<String> string = x -> x + "!";
+                    public @Deprecated given <A> Show<java.util.List<A>> list(using Show<A> e) {
+                        return xs -> xs.stream().map(e::show).toList().toString();
+                    }
+                }
+                """, "app/App.java", """
+                package app;
+                import static lib.Shout.*;
+                import java.util.List;
+                public class App {
+                    @SuppressWarnings("removal")
+                    public static Object run() {
+                        @SuppressWarnings("unused") given lib.Shout.Show<Integer> ints = i -> "#" + i;
+                        return List.of("hi".shout(), List.of("a", "b").shout(), shout(3));
+                    }
+                }
+                """));
+        assertEquals(List.of("HI!", "[A!, B!]", "#3"), c.call("app.App", "run"));
+    }
+
     @Test
     void aNestedTypeCanRedeclareAHigherKindedParameter() throws Exception {
         var c = compile(Map.of("app/Outer.java", """

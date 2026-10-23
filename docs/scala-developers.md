@@ -253,11 +253,12 @@ Differences from Scala 3:
 
   It's closer to a scoped implicit conversion into `Kind` than to anything cats does. The Java
   guide lists where it applies and its caveats.
-- Overloads that take `using` parameters are told apart by their ordinary arguments only;
-  there's no "most specific" ranking, so two overloads that both fit are ambiguous.
+- Overloads that take `using` parameters are told apart by their ordinary arguments only.
+  When several fit, the most specific wins (javac's rule, on erased parameter types).
 - Type parameters that only appear in `using` parameters are inferred from the expected
   type:
-  - a typed local, a `return` or an assignment;
+  - a typed local, a `return` (also inside a lambda) or an assignment, through `?:` and
+    parentheses;
   - the parameter the call is passed to (`app.through(errors())`), with the receiver's type
     arguments substituted.
 

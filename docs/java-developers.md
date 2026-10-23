@@ -285,6 +285,10 @@ IO<Receipt> program = checkout(order);      // F = IO, inferred from the target
 
 The target can be:
 - a typed local, a `return` or an assignment;
+- a `return` inside a lambda: in `Decoder<A> d = (body, strict) -> { return decode(body); };`
+  the target is `A`, the return type of the method the lambda implements;
+- either branch of `?:`, or an expression in parentheses: they get the whole expression's
+  target;
 - an argument: in `app.through(errors())` on an `HttpApp<IO>`, `through` takes a
   `Middleware<IO>`, so `errors()` gets `F = IO`.
 
@@ -658,8 +662,10 @@ Compared with Java's `ScopedValue`, which does a similar job at runtime:
   The Mill build is the source of truth.
 - **Overloads with `using` parameters are picked by their ordinary arguments.**
   `decode(byte[])(using Codec<A>)` next to `decode(InputStream)(using Codec<A>)` is fine.
-  Two overloads that both accept the arguments are still ambiguous: forj doesn't rank the more
-  specific one, and an argument whose type isn't known yet (an implicit lambda) accepts either.
+  When several accept the arguments, the most specific wins, as in javac: `json(A value)` next
+  to `json(Request request)` picks `json(Request)` for a `Request` and `json(A)` for anything
+  else. Overloads that only differ where the argument's type isn't known yet (an implicit
+  lambda) are still ambiguous.
 - **A `using` clause after varargs moves in front of them.** javac wants the varargs
   parameter last, so `of(Route<F>... routes)(using Applicative<F> ap)` compiles to
   `of(Applicative<F> ap, Route<F>... routes)`. forj callers don't notice. Plain Java callers

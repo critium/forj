@@ -140,6 +140,39 @@ forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on
     including `Other#m(...)` links from other files (`ExportSourcesTest`). Links that already
     list every parameter, or match no such method or more than one, stay as written.
 
+### Found in forj-http's JSON bridge (2026-10-23)
+
+- **Fixed (2026-10-23, `ForjHttpLimitsTest`, published to ~/.m2 as 0.1.0-SNAPSHOT): a generic overload and a concrete one, both with `using`, were "ambiguous".** Candidates that fit are now ranked by javac's most-specific rule (`moreSpecific`, on erased ordinary parameters). It was the known gap (no "most specific overload" ranking), met for real. forj-http-json wants:
+  ```java
+  static <A> Entity json(A value)(using Codec<A> c, JsonBackend b)            // Ok(json(user))
+  extension <A> A json(Request request)(using Codec<A> c, JsonBackend b)      // User u = req.json();
+  ```
+  `json(new User(...))` fails with `forj: ambiguous call: 2 methods named json take using
+  parameters`, though only the first fits a `User`. A `Request` argument fits both, and javac
+  would pick `json(Request)` as the more specific one.
+  - Likely fix: drop candidates whose ordinary parameters don't accept the argument types
+    (a `User` isn't a `Request`), then rank what's left by javac's most-specific rule.
+  - Workaround in forj-http: the extension is named `jsonBody`
+    (`server/http-json/src/main/java/forj/http/json/HttpJson.java`). Rename it back to
+    `req.json()` when this is fixed.
+- **Fixed (2026-10-23, `ForjHttpLimitsTest`, published to ~/.m2 as 0.1.0-SNAPSHOT): `A` wasn't inferred from a lambda's return, nor through `?:`.** `targetOf` now gives a `return` in a lambda the lambda's interface method's return type (the lambda's own target found the same way), and passes a conditional's or parentheses' target to its branches. Inside
+  `static <A> EntityDecoder<A> decoder()(using Codec<A> c, JsonBackend b)`:
+  ```java
+  return (body, headers) -> {
+      if (body instanceof Body.Bytes bytes) return Json.decode(bytes.bytes());   // forj: cannot infer the type of using parameter
+      return Json.decode(body.stream());
+  };
+  ```
+  The lambda implements `EntityDecoder<A>.decode`, so each `return` has target `A`, as a
+  method's `return` does. A conditional (`A v = x ? Json.decode(a) : Json.decode(b);`) fails
+  the same way, even with a typed local: its branches don't get the conditional's target.
+  - Likely fix: treat a `return` in a lambda as targeting the functional interface method's
+    return type (when the lambda's own target is known), and pass a conditional's target to
+    both branches.
+  - Workaround in forj-http: `Json.<A>decode(...)` (`HttpJson.decoder`).
+- **Fixed (2026-10-23, `ForjHttpLimitsTest`, published to ~/.m2 as 0.1.0-SNAPSHOT): an annotation before `extension` or `given` didn't parse.** `@Deprecated extension <A> A jsonBody(...)` gave "';' expected": the keyword was only recognised right after `{`, `}`, `;` or an access modifier. `startsMember` now also skips annotations (`modifiersStart`, `annotationStart`).
+  - forj-http had used the annotation spelling on a `jsonBody` alias, since deleted: forj-http has no forj workarounds left.
+
 ### API docs on GitHub Pages (2026-10-23)
 
 **Status:** ready, not yet pushed.
@@ -335,8 +368,8 @@ spelling.
 - **Overloads that take `using` parameters** are now chosen by their ordinary arguments
   (`decode(byte[])` vs `decode(InputStream)`, fixed 2026-10-06), so forj-codec can go back to
   real overloads instead of `read`/`write`. Still ambiguous: overloads that only differ in a
-  parameter whose argument type isn't known yet (an implicit lambda), and no "most specific
-  overload" ranking (e.g. `decode(Object)` vs `decode(String)` with a `String`).
+  parameter whose argument type isn't known yet (an implicit lambda). The most specific fitting
+  overload wins (fixed 2026-10-23).
 
 ## Toward real type classes
 

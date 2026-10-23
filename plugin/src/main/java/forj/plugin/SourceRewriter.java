@@ -288,10 +288,7 @@ final class SourceRewriter {
                     continue;
                 }
                 boolean inClass = Boolean.TRUE.equals(braces.peek());
-                boolean hasAccess = i > 0 && switch (tokens.get(i - 1).kind) {
-                    case PUBLIC, PRIVATE, PROTECTED -> true;
-                    default -> false;
-                };
+                boolean hasAccess = hasAccess(tokens, i);
                 String modifiers = !inClass ? "final"
                         : (hasAccess ? "" : "public ") + (declares == TokenKind.EQ ? "static final" : "static");
                 edits.add(new Edit(t.pos, t.endPos, GIVEN_ANNOTATION + modifiers, 0, Kind.TEXT));
@@ -299,10 +296,7 @@ final class SourceRewriter {
                     && Boolean.TRUE.equals(braces.peek())
                     && (tokens.get(i + 1).kind == TokenKind.IDENTIFIER || tokens.get(i + 1).kind == TokenKind.LT)
                     && firstAtDepthZero(tokens, i + 1, TokenKind.EQ, TokenKind.LPAREN, TokenKind.SEMI) == TokenKind.LPAREN) {
-                boolean hasAccess = i > 0 && switch (tokens.get(i - 1).kind) {
-                    case PUBLIC, PRIVATE, PROTECTED -> true;
-                    default -> false;
-                };
+                boolean hasAccess = hasAccess(tokens, i);
                 edits.add(new Edit(t.pos, t.endPos, EXTENSION_ANNOTATION + (hasAccess ? "" : "public ") + "static", 0, Kind.TEXT));
             }
         }
@@ -375,15 +369,86 @@ final class SourceRewriter {
         return -1;
     }
 
-    /** At a declaration boundary, optionally after an access modifier. */
+    /**
+     * At a declaration boundary, optionally after access modifiers and annotations:
+     * {@code @Deprecated(forRemoval = true) extension ...}.
+     */
     private static boolean startsMember(List<Token> tokens, int i) {
-        if (i == 0) {
-            return true;
+        int j = modifiersStart(tokens, i);
+        if (j < 0) {
+            return false;
         }
-        return switch (tokens.get(i - 1).kind) {
-            case LBRACE, RBRACE, SEMI, PUBLIC, PRIVATE, PROTECTED -> true;
+        return j == 0 || switch (tokens.get(j - 1).kind) {
+            case LBRACE, RBRACE, SEMI -> true;
             default -> false;
         };
+    }
+
+    /** Whether an access modifier is among the modifiers and annotations before index {@code i}. */
+    private static boolean hasAccess(List<Token> tokens, int i) {
+        int j = modifiersStart(tokens, i);
+        for (int k = Math.max(j, 0); k < i; k++) {
+            switch (tokens.get(k).kind) {
+                case PUBLIC, PRIVATE, PROTECTED -> {
+                    return true;
+                }
+                default -> { }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The first index of the run of access modifiers and annotations ending just before
+     * {@code i} ({@code i} itself when there are none), or -1 when what's before isn't such a
+     * run's end: a type, say, as in {@code Foo given = ...}.
+     */
+    private static int modifiersStart(List<Token> tokens, int i) {
+        int j = i;
+        while (j > 0) {
+            Token prev = tokens.get(j - 1);
+            switch (prev.kind) {
+                case PUBLIC, PRIVATE, PROTECTED -> j--;
+                case RPAREN, IDENTIFIER -> {
+                    int at = annotationStart(tokens, j - 1);
+                    if (at < 0) {
+                        return -1;
+                    }
+                    j = at;
+                }
+                default -> {
+                    return j;
+                }
+            }
+        }
+        return j;
+    }
+
+    /** The index of the {@code @} of the annotation ending at {@code end}, or -1. */
+    private static int annotationStart(List<Token> tokens, int end) {
+        int k = end;
+        if (tokens.get(k).kind == TokenKind.RPAREN) {
+            int depth = 0;
+            for (; k >= 0; k--) {
+                TokenKind kind = tokens.get(k).kind;
+                if (kind == TokenKind.RPAREN) {
+                    depth++;
+                } else if (kind == TokenKind.LPAREN && --depth == 0) {
+                    break;
+                }
+            }
+            k--;   // the annotation's name, before its (
+        }
+        // the name: Ident (. Ident)*
+        while (k >= 0 && tokens.get(k).kind == TokenKind.IDENTIFIER) {
+            if (k > 0 && tokens.get(k - 1).kind == TokenKind.DOT) {
+                k -= 2;
+            } else {
+                k--;
+                break;
+            }
+        }
+        return k >= 0 && k < end && tokens.get(k).kind == TokenKind.MONKEYS_AT ? k : -1;
     }
 
     /** For each token index holding a {@code {}, whether it opens a class body. */
