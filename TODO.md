@@ -104,6 +104,29 @@ Follow-ups:
     (`describe(checkout(order))`, with `describe` generic), the outer call must be inferred
     first; see "given/using follow-ups".
 
+### Found in forj-http step 3 (2026-10-22)
+
+**Status:** the two resolver bugs are fixed (`ForjHttpLimitsTest`), javadoc is open.
+forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on the class.
+
+- **Fixed: an overload whose `using` count equals the call's argument count took the
+  arguments as its instances.** `log(s -> {})` next to `log()(using Applicative<F>)` picked
+  `log()`, with the lambda as `ap`. The "every argument already passed" check compared
+  against the ordinary parameters and let any lambda through. It now checks against all
+  parameters, and a lambda or method reference only fits a functional interface. Passing the
+  instance explicitly (`log(IO.concurrent)`) still picks `log()`.
+- **Fixed: calling an overridden `using` method on the implementing class was "ambiguous".**
+  The method search found both `Impl.start` and the `Starter.start` it overrides. Now
+  overridden methods are dropped, as javac does (`MethodSymbol.overrides`).
+- **Publishing: javadoc can't read forj sources.** Mill's `publishM2Local` builds a javadoc
+  jar, and the `javadoc` tool parses sources without the plugin, so `<F<_>>`, `(using ...)`
+  and the rest are syntax errors. A real fix would let javadoc see the desugared sources,
+  for example a plugin option that writes `SourceRewriter`'s output to a directory to run
+  javadoc on (positions don't matter there).
+  - Workaround: forj-http's `ForjModule` publishes a placeholder javadoc jar pointing at the
+    sources jar (`server/build.mill`, `docJar`). Belongs in the shared Mill plugin when there
+    is one.
+
 ## Enforce a coding style (2-space indentation)
 
 **Status:** open, added 2026-10-06. The preferred style is 2 spaces; the code is 4 spaces

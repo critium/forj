@@ -207,7 +207,8 @@ files.
 | Path | What it is |
 |---|---|
 | `core/` | `forj.Kind` and the type class ladder (`forj.typeclass`), the `IO` effect (`forj.effect`), instances for JDK types (`forj.Instances`), what comprehensions compile to (`forj.For`), `forj.Par`, `@Given`/`@Using`/`@Lower`. No dependencies. |
-| `plugin/` | The javac plugin: `SourceRewriter` and `Interpolations` (text stage), `Desugarer` (forj blocks), `ImplicitResolver` (`given`/`using`), and the glue that installs them into javac. |
+| `plugin/` | The javac plugin: `SourceRewriter` and `Interpolations` (text stage), `Desugarer` (forj blocks) and `Deriver` (`derives`) at parse time, `ImplicitResolver` (`given`/`using`) with `Extensions`, `Lifting` and `DerivationSpecializer` before type checking, and the glue that installs them into javac. |
+| `AGENTS.md` | How to read and write forj code, and how the plugin is put together, for coding agents (`CLAUDE.md` imports it). |
 | `examples/` | Example code and tests: a third-party monad (`StreamMonad`), a small HTTP server (`http/`), type classes with `given`/`using` (`typeclasses/`), generic code over any `F` and any value type: `Monad`, `Applicative`, `Semigroup`/`Monoid`, `Traverse` (`hkt/`), and tagless final with two interpreters (`tagless/`). |
 | `bin/fetch-jdk` | Downloads and verifies the pinned JDK, then runs `bin/make-preview-jdk`. |
 | `TODO.md` | Known issues and planned work. |

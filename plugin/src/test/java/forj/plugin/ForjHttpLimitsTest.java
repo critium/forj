@@ -107,6 +107,69 @@ class ForjHttpLimitsTest {
     }
 
     @Test
+    void anOverloadIsPickedByItsOrdinaryParametersNotItsUsingCount() throws Exception {
+        var c = compile(Map.of("lib/Over.java", """
+                package lib;
+                import forj.typeclass.Applicative;
+                import java.util.function.Consumer;
+                public final class Over {
+                    public static <F<_>> F<String> log()(using Applicative<F> ap) { return ap.pure("plain"); }
+                    public static <F<_>> F<String> log(Consumer<String> sink)(using Applicative<F> ap) {
+                        sink.accept("x");
+                        return ap.pure("sink");
+                    }
+                }
+                """, "app/App.java", """
+                package app;
+                import static lib.Over.log;
+                import forj.effect.IO;
+                import java.util.List;
+                public class App {
+                    public static Object run() throws Exception {
+                        IO<String> a = log();
+                        IO<String> b = log(s -> {});
+                        IO<String> c = log((String s) -> {});
+                        IO<String> d = log(IO.concurrent);                // the instance, passed explicitly
+                        return List.of(a.runSync(), b.runSync(), c.runSync(), d.runSync());
+                    }
+                }
+                """));
+        assertEquals(List.of("plain", "sink", "sink", "plain"), c.call("app.App", "run"));
+    }
+
+    @Test
+    void anOverridingUsingMethodIsNotAmbiguousWithTheOneItOverrides() throws Exception {
+        var c = compile(Map.of("lib/Starter.java", """
+                package lib;
+                import forj.typeclass.Applicative;
+                public interface Starter {
+                    <F<_>> F<String> start(String name)(using Applicative<F> ap);
+                }
+                """, "lib/Impl.java", """
+                package lib;
+                import forj.typeclass.Applicative;
+                public final class Impl implements Starter {
+                    public <F<_>> F<String> start(String name)(using Applicative<F> ap) { return ap.pure("started " + name); }
+                }
+                """, "app/App.java", """
+                package app;
+                import forj.effect.IO;
+                import java.util.List;
+                import lib.Impl;
+                import lib.Starter;
+                public class App {
+                    public static Object run() throws Exception {
+                        Starter s = new Impl();
+                        IO<String> a = s.start("a");
+                        IO<String> b = new Impl().start("b");
+                        return List.of(a.runSync(), b.runSync());
+                    }
+                }
+                """));
+        assertEquals(List.of("started a", "started b"), c.call("app.App", "run"));
+    }
+
+    @Test
     void aNestedTypeCanRedeclareAHigherKindedParameter() throws Exception {
         var c = compile(Map.of("app/Outer.java", """
                 package app;

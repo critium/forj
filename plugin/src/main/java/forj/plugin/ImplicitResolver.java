@@ -425,7 +425,7 @@ final class ImplicitResolver {
                 int using = usingCount(m);
                 boolean varargs = usingBeforeVarargs(m);
                 if (params == call.args.size() && !varargs) {
-                    plainOverload |= accepts(m);
+                    plainOverload |= acceptsAsPassed(m);
                 } else if (varargs && usingsInPlace(m)) {
                     plainOverload = true;   // of(m, a, b): resolved already, or written that way
                 } else if (using > 0 && (params - using == call.args.size()
@@ -782,6 +782,29 @@ final class ImplicitResolver {
             return argTypes;
         }
 
+        /**
+         * Could {@code m} take the call's arguments as they stand, its using parameters included
+         * (instances passed explicitly, or a plain call)? A lambda or method reference only fits
+         * a functional interface: {@code log(s -> {})} doesn't mean {@code log()} with the
+         * lambda as its {@code Applicative}.
+         */
+        private boolean acceptsAsPassed(MethodSymbol m) {
+            List<Type> params = m.type.getParameterTypes();
+            for (int i = 0; i < call.args.size() && i < params.size(); i++) {
+                Type arg = argTypes().get(i);
+                Type param = types.erasure(params.get(i));
+                if (arg != null ? !types.isConvertible(arg, param)
+                        : isFunctionLiteral(call.args.get(i)) && !types.isFunctionalInterface(param)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static boolean isFunctionLiteral(JCExpression e) {
+            return e instanceof JCLambda || e instanceof JCTree.JCMemberReference;
+        }
+
         /** Could {@code m}'s ordinary parameters take the call's arguments? Unknown counts as yes. */
         private boolean accepts(MethodSymbol m) {
             return accepts(m, false);
@@ -810,8 +833,27 @@ final class ImplicitResolver {
             return methodsNamed(call.meth, name);
         }
 
-        /** The methods {@code meth(...)}, called from this call's scope, could mean. */
+        /**
+         * The methods {@code meth(...)}, called from this call's scope, could mean; a method
+         * another one in the set overrides is left out, as javac does
+         * ({@code new Impl().start(...)} is {@code Impl.start}, not also {@code Starter.start}).
+         */
         private Set<Symbol> methodsNamed(JCExpression meth, Name name) {
+            Set<Symbol> found = candidatesNamed(meth, name);
+            Set<Symbol> overridden = new java.util.HashSet<>();
+            for (Symbol s : found) {
+                for (Symbol o : found) {
+                    if (o != s && o instanceof MethodSymbol om
+                            && om.overrides(s, (com.sun.tools.javac.code.Symbol.TypeSymbol) om.owner, types, true)) {
+                        overridden.add(s);
+                    }
+                }
+            }
+            found.removeAll(overridden);
+            return found;
+        }
+
+        private Set<Symbol> candidatesNamed(JCExpression meth, Name name) {
             Set<Symbol> found = new LinkedHashSet<>();
             if (meth instanceof JCFieldAccess select) {
                 Type asValue = speculate(select.selected, false);
