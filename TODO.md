@@ -75,8 +75,7 @@ Follow-ups:
 
 ## Found while building forj-http (2026-10-22)
 
-**Status:** three fixed (2026-10-22, `ForjHttpLimitsTest`), one open. forj-http can drop the
-workarounds for the fixed ones.
+**Status:** all fixed (2026-10-22, `ForjHttpLimitsTest`). forj-http can drop the workarounds.
 
 - **Fixed: a nested type that redeclares `F<_>` crashed the rewriter**
   (`IndexOutOfBoundsException` from `SourceRewriter.apply`). The outer and inner scopes both
@@ -92,12 +91,18 @@ workarounds for the fixed ones.
 - **Fixed: instance methods ignored the receiver's type arguments.** `routes.orNotFound()` on
   a `Routes<IO>` now looks for `Applicative<IO>`: the resolver binds the owner class's type
   variables from `asSuper(receiverType, owner)` (wildcard arguments stay unbound).
-- **Arguments that leave `F` unconstrained win over the target.** `Routes<IO> r =
-  Routes.of(GET(p).respond(...))(using Applicative<F>)`, where `respond` is
-  `<F<_>> Route<F> respond(...)`: speculating the argument alone gives `Route<Object>`, so
-  `F = Object` and resolution fails, although the typed local says `IO`. Binding to `Object`
-  from an argument whose own type variable was unconstrained should yield to the target.
-  - Workaround: `Routes.of` takes no `using` at all; javac infers `F` from the target.
+- **Fixed: arguments that leave `F` unconstrained no longer win over the target.**
+  `Routes<IO> r = Routes.of(constant("a"))`, where `constant` is `<F<_>> Route<F>` and takes
+  no `using`, used to speculate as `Route<Object>` and bind `F = Object`. Now a binding to
+  exactly `Object` from an argument yields to the target when there is one.
+- **Fixed: inferring `F` in argument position** (forj-http's middleware):
+  `app.through(errors())`, where `errors()` is `<F<_>> Middleware<F> errors()(using
+  MonadError<F, Throwable>)`. The parameter `errors()` is passed to (`through(Middleware<F>)`,
+  with `F = IO` from the `HttpApp<IO>` receiver) is now a target, like a typed local. Every
+  method the outer call could be must agree on that parameter's type.
+  - Still open: if that parameter mentions the outer method's own type variables
+    (`describe(checkout(order))`, with `describe` generic), the outer call must be inferred
+    first; see "given/using follow-ups".
 
 ## Enforce a coding style (2-space indentation)
 
@@ -258,10 +263,11 @@ spelling.
 - Ambiguous givens are an error even where Scala would pick the more specific one.
 - Each call site re-attributes its enclosing method up to the call (`Trees.getScope`), which
   is quadratic in method size. Cache scopes per method if it shows up in build times.
-- Return-type inference for `using` methods works from a typed local, a `return` or an
-  assignment, but not from an argument position: `describe(checkout(order))` can't infer
-  `checkout`'s `F` from `describe`'s parameter (which itself comes from `describe`'s target).
-  Needs inference across nested calls.
+- Return-type inference for `using` methods works from a typed local, a `return`, an
+  assignment, and an argument whose parameter type is known (`app.through(errors())`, fixed
+  2026-10-22). It doesn't work when that parameter mentions the outer method's own type
+  variables: `describe(checkout(order))` can't infer `checkout`'s `F` from `describe`'s
+  parameter, which itself comes from `describe`'s target. Needs inference across nested calls.
 - **No inference from method references.** `Codec.field("id", User::id)(using Codec<F>)`
   can't infer `F` from `User::id`, so forj-codec's hand-written codecs spell it out:
   `Codec.<User, Long>field("id", User::id)`. `derives` knows the component types and can

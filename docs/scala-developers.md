@@ -255,8 +255,15 @@ Differences from Scala 3:
   guide lists where it applies and its caveats.
 - Overloads that take `using` parameters are told apart by their ordinary arguments only;
   there's no "most specific" ranking, so two overloads that both fit are ambiguous.
-- Type parameters that only appear in `using` parameters can't be inferred from the call;
-  pass them explicitly (`Owner.<Integer>empty()`).
+- Type parameters that only appear in `using` parameters are inferred from the expected
+  type:
+  - a typed local, a `return` or an assignment;
+  - the parameter the call is passed to (`app.through(errors())`), with the receiver's type
+    arguments substituted.
+
+  If the outer method is generic too (`describe(checkout(order))`), forj can't infer them:
+  pass them explicitly (`Owner.<IO>checkout(order)`). An `Object` inferred from an argument
+  whose own type parameter was unconstrained yields to the expected type.
 - `using` methods are found when declared in sources being compiled or in imported classes.
 
 ## `derives`

@@ -39,6 +39,73 @@ class ForjHttpLimitsTest {
             }
             """;
 
+    /** forj-http's middleware shape: an F-generic app, and middleware that only needs F's instances. */
+    static final String APP = """
+            package lib;
+            import forj.typeclass.Applicative;
+            import forj.typeclass.MonadError;
+            import java.util.function.Function;
+            public final class HttpApp<F<_>> {
+                public interface Middleware<G<_>> { Function<String, G<String>> wrap(Function<String, G<String>> next); }
+                private final Function<String, F<String>> run;
+                public HttpApp(Function<String, F<String>> run) { this.run = run; }
+
+                public HttpApp<F> through(Middleware<F> m) { return new HttpApp<>(m.wrap(run)); }
+
+                public F<String> apply(String request) { return run.apply(request); }
+
+                public static <F<_>> Middleware<F> errors()(using MonadError<F, Throwable> me) {
+                    return next -> req -> me.handleErrorWith(next.apply(req), e -> me.pure("500 " + e.getMessage()));
+                }
+
+                public static <F<_>> Middleware<F> tagged(String tag)(using Applicative<F> ap) {
+                    return next -> req -> ap.map(next.apply(req), body -> tag + body);
+                }
+
+                /** Leaves its F unconstrained: speculated alone, it is a Route<Object>. */
+                public static <F<_>> Routes.Route<F> constant(String body) {
+                    return () -> { throw new UnsupportedOperationException(body); };
+                }
+            }
+            """;
+
+    @Test
+    void aUsingCallAsAnArgumentTakesFFromTheParameter() throws Exception {
+        var c = compile(Map.of("lib/Routes.java", ROUTES, "lib/HttpApp.java", APP, "app/App.java", """
+                package app;
+                import static lib.HttpApp.errors;
+                import static lib.HttpApp.tagged;
+                import forj.effect.IO;
+                import java.util.List;
+                import lib.HttpApp;
+                public class App {
+                    public static Object run() throws Exception {
+                        HttpApp<IO> app = new HttpApp<IO>(req -> req.isEmpty() ? IO.raiseError(new IllegalStateException("empty")) : IO.pure("200 " + req));
+                        HttpApp<IO> served = app.through(errors()).through(tagged("> "));
+                        return List.of(((IO<String>) served.apply("hi")).runSync(), ((IO<String>) served.apply("")).runSync());
+                    }
+                }
+                """));
+        assertEquals(List.of("> 200 hi", "> 500 empty"), c.call("app.App", "run"));
+    }
+
+    @Test
+    void anArgumentLeavingFUnconstrainedYieldsToTheTarget() throws Exception {
+        var c = compile(Map.of("lib/Routes.java", ROUTES, "lib/HttpApp.java", APP, "app/App.java", """
+                package app;
+                import static lib.HttpApp.constant;
+                import forj.effect.IO;
+                import lib.Routes;
+                public class App {
+                    public static Object run() {
+                        Routes<IO> routes = Routes.of(constant("a"), constant("b"));   // F is IO, not Object
+                        return routes.size();
+                    }
+                }
+                """));
+        assertEquals(2, c.call("app.App", "run"));
+    }
+
     @Test
     void aNestedTypeCanRedeclareAHigherKindedParameter() throws Exception {
         var c = compile(Map.of("app/Outer.java", """

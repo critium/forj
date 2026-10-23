@@ -281,6 +281,14 @@ given Payments<IO> payments = new Live.Bank();
 IO<Receipt> program = checkout(order);      // F = IO, inferred from the target
 ```
 
+The target can be:
+- a typed local, a `return` or an assignment;
+- an argument: in `app.through(errors())` on an `HttpApp<IO>`, `through` takes a
+  `Middleware<IO>`, so `errors()` gets `F = IO`.
+
+forj doesn't infer across two generic calls (`describe(checkout(order))`, where `describe` is
+generic too). Give `F` there with a typed local or `checkout.<IO>(...)`.
+
 `examples/.../tagless/` runs the same `checkout` in `IO` and in plain `Callable`, and has
 `Ladder.java` with one function per capability level.
 

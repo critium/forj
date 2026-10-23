@@ -172,6 +172,8 @@ final class ImplicitResolver {
     /** The {@code forj} identifiers the desugarer generated ({@code forj.For.forjFlatMap}); see {@code unshadow}. */
     private final Set<JCTree.JCIdent> generatedQualifiers;
 
+    private final Type objectType;
+
     ImplicitResolver(Context context, Trees trees, javax.lang.model.util.Elements elements,
                      ClassSymbol givenAnnotation, ClassSymbol usingAnnotation, Set<JCTree.JCIdent> generatedQualifiers,
                      List<Deriver.Derivation> derivations) {
@@ -189,6 +191,7 @@ final class ImplicitResolver {
             throw new IllegalStateException("forj: needs --add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED", e);
         }
         this.types = Types.instance(context);
+        this.objectType = com.sun.tools.javac.code.Symtab.instance(context).objectType;
         this.rs = Resolve.instance(context);
         this.log = Log.instance(context);
         this.make = TreeMaker.instance(context);
@@ -543,14 +546,27 @@ final class ImplicitResolver {
                 argTypes = null;   // the lifted arguments are Kinds now: infer from those
             }
             Map<TypeVar, Type> bindings = inferTypeArguments(method);
-            if (method.type.getTypeArguments().stream().anyMatch(tv -> !bindings.containsKey((TypeVar) tv))) {
+            // Object from an argument usually means the argument's own type variable was left
+            // unconstrained (Routes.of(constant("a")) speculates constant("a") alone, as a
+            // Route<Object>), never what the user meant: the target, when there is one, wins
+            List<Type> tvars = method.type.getTypeArguments();
+            if (call.typeargs.isEmpty() && tvars.stream().anyMatch(tv -> {
+                Type bound = bindings.get((TypeVar) tv);
+                return bound == null || types.isSameType(bound, objectType);
+            })) {
                 Type target = targetType();
                 if (target != null && !target.isErroneous()) {
                     // a JDK target (Callable<User>) stands for the Kind its @Lower method takes, but only
                     // for methods returning a Kind: `<A> A decode(...)` into a List<String> means A = List<String>
                     Lowering lowering = enabled(LIFT_RESULTS) && returnsKind(method) ? lowering(target) : null;
-                    unify(method.type.getReturnType(), lowering != null ? lowering.kind() : target, bindings,
-                            method.type.getTypeArguments());
+                    Map<TypeVar, Type> fromTarget = new HashMap<>();
+                    unify(method.type.getReturnType(), lowering != null ? lowering.kind() : target, fromTarget, tvars);
+                    fromTarget.forEach((tv, t) -> {
+                        Type bound = bindings.get(tv);
+                        if (bound == null || types.isSameType(bound, objectType)) {
+                            bindings.put(tv, t);
+                        }
+                    });
                 }
             }
             trace("  args " + argTypes() + " bindings " + bindings);
@@ -995,8 +1011,65 @@ final class ImplicitResolver {
                 case JCReturn r -> insideLambda(parent) || env.enclMethod == null || env.enclMethod.sym == null
                         ? null : env.enclMethod.sym.type.getReturnType();
                 case JCAssign a -> speculate(a.lhs, false);
+                case JCMethodInvocation outer when outer.args.stream().anyMatch(arg -> arg == path.getLeaf()) ->
+                        argumentTarget(outer, (JCExpression) path.getLeaf());
                 default -> null;
             };
+        }
+
+        /**
+         * This call is an argument of {@code outer}: the type of the parameter it is passed to,
+         * when every method {@code outer} could be agrees on it. Type variables of that method's
+         * class come from its receiver ({@code app.through(errors())} on an {@code HttpApp<IO>}
+         * wants a {@code Middleware<IO>}). A parameter that mentions the outer method's own type
+         * variables gives nothing: those need the outer call inferred first
+         * ({@code describe(checkout(order))}).
+         */
+        private Type argumentTarget(JCMethodInvocation outer, JCExpression arg) {
+            int i = outer.args.indexOf(arg);
+            Type found = null;
+            for (Symbol s : methodsNamed(outer.meth, TreeInfo.name(outer.meth))) {
+                MethodSymbol m = (MethodSymbol) s;
+                Type param = parameterAt(m, i, outer.args.size());
+                if (param == null) {
+                    continue;
+                }
+                Map<TypeVar, Type> bindings = new HashMap<>();
+                if (!bindReceiver(outer.meth, m, bindings)) {
+                    return null;
+                }
+                Type t = substitute(param, bindings);
+                if (hasUnbound(t, m, bindings) || found != null && !types.isSameType(found, t)) {
+                    return null;
+                }
+                found = t;
+            }
+            return found;
+        }
+
+        /**
+         * The declared type of parameter {@code i} when {@code m} is called with {@code n}
+         * arguments: all of them passed (an ordinary call, or one resolved already), or only the
+         * ordinary ones (using arguments still to come). Null when {@code m} takes no {@code n}.
+         */
+        private Type parameterAt(MethodSymbol m, int i, int n) {
+            boolean varargs = (m.flags() & Flags.VARARGS) != 0;
+            List<Type> all = m.type.getParameterTypes();
+            List<Type> ordinary = new ArrayList<>();
+            for (int j = 0; j < all.size(); j++) {
+                if (!isUsing(m.params().get(j))) {
+                    ordinary.add(all.get(j));
+                }
+            }
+            for (List<Type> shape : List.of(all, ordinary)) {
+                if (varargs ? n >= shape.size() - 1 : n == shape.size()) {
+                    if (varargs && i >= shape.size() - 1) {
+                        return ((ArrayType) shape.getLast()).elemtype;
+                    }
+                    return i < shape.size() ? shape.get(i) : null;
+                }
+            }
+            return null;
         }
 
         private boolean insideLambda(TreePath from) {
@@ -1166,8 +1239,13 @@ final class ImplicitResolver {
         // ------------------------------------------------- which methods could this be?
 
         private Set<Symbol> methodsNamed(Name name) {
+            return methodsNamed(call.meth, name);
+        }
+
+        /** The methods {@code meth(...)}, called from this call's scope, could mean. */
+        private Set<Symbol> methodsNamed(JCExpression meth, Name name) {
             Set<Symbol> found = new LinkedHashSet<>();
-            if (call.meth instanceof JCFieldAccess select) {
+            if (meth instanceof JCFieldAccess select) {
                 Type asValue = speculate(select.selected, false);
                 boolean viaType = asValue == null || asValue.isErroneous();
                 Type site = viaType ? speculate(select.selected, true) : asValue;
@@ -1213,7 +1291,7 @@ final class ImplicitResolver {
         /** Binds the method's type variables from explicit type arguments and argument types. */
         private Map<TypeVar, Type> inferTypeArguments(MethodSymbol method) {
             Map<TypeVar, Type> bindings = new HashMap<>();
-            bindReceiver(method, bindings);
+            bindReceiver(call.meth, method, bindings);
             List<Type> tvars = method.type.getTypeArguments();
             if (call.typeargs.nonEmpty()) {
                 if (call.typeargs.size() != tvars.size()) {
@@ -1242,26 +1320,34 @@ final class ImplicitResolver {
          * variables from the receiver's type, so {@code routes.orNotFound()} on a
          * {@code Routes<IO>} needs an {@code Applicative<IO>}, not an {@code Applicative<F>}.
          */
-        private void bindReceiver(MethodSymbol method, Map<TypeVar, Type> bindings) {
-            if ((method.flags() & Flags.STATIC) != 0 || !(call.meth instanceof JCFieldAccess select)
+        /**
+         * Whether the receiver's type is known, when there is one: false for a receiver that
+         * doesn't type check (yet), or a raw one.
+         */
+        private boolean bindReceiver(JCExpression meth, MethodSymbol method, Map<TypeVar, Type> bindings) {
+            if ((method.flags() & Flags.STATIC) != 0 || !(meth instanceof JCFieldAccess select)
                     || isCastedNull(select.selected)) {
-                return;
+                return true;
             }
             Type receiver = speculate(select.selected, false);
             if (receiver == null || receiver.isErroneous()) {
-                return;
+                return false;
             }
             Type site = types.asSuper(types.skipTypeVars(receiver, false), method.owner);
             if (site == null) {
-                return;
+                return false;
             }
             List<Type> params = method.owner.type.getTypeArguments();
             List<Type> args = site.getTypeArguments();
-            for (int i = 0; i < Math.min(params.size(), args.size()); i++) {
+            if (args.size() < params.size()) {
+                return false;   // raw
+            }
+            for (int i = 0; i < params.size(); i++) {
                 if (params.get(i) instanceof TypeVar v && !(args.get(i) instanceof WildcardType)) {
                     bindings.put(v, args.get(i));
                 }
             }
+            return true;
         }
 
         /**
