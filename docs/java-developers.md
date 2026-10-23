@@ -1,0 +1,713 @@
+# forj for Java developers
+
+This guide assumes you know Java (lambdas, `Optional`, streams) but not Scala. It starts
+from the nested `flatMap` chains forj replaces, then covers `F<_>` and `IO`, type classes with
+`given`/`using`, `derives`, extension methods and string interpolation.
+
+## The problem it solves
+
+Chaining `flatMap` calls is how you combine values that might be absent, contain many
+elements, or haven't been computed yet. With more than two steps it gets hard to read:
+
+```java
+Optional<String> city =
+    findUser(name).flatMap(user ->
+        user.managerName().flatMap(manager ->
+            findAddress(manager).map(address ->
+                address.city())));
+```
+
+forj lets you write the same thing as a flat list of steps:
+
+```java
+Optional<String> city = forj {
+    user <- findUser(name);
+    manager <- user.managerName();
+    address <- findAddress(manager);
+} yield address.city();
+```
+
+Read `user <- findUser(name);` as "take the value out of `findUser(name)` and call it
+`user`". If any step is empty, the whole result is empty, exactly as with the nested
+`flatMap` version. The compiler turns one into the other; there is no runtime magic.
+
+## Syntax
+
+| Form | Meaning |
+|---|---|
+| `x <- expr;` | **Generator.** `expr` is an `Optional`, `List`, `Callable`, ...; `x` is each value inside it. |
+| `_ <- expr;` | Generator whose value you don't need (for example, a check that may be empty). |
+| `guard(cond);` | **Filter.** Keeps only values for which `cond` is true. Must come directly after a generator (or another guard). |
+| `var y = ...;` | Ordinary local variable, usable in later steps. |
+| `} yield expr;` | **Result.** The value placed back into the container. |
+
+The whole `forj { ... } yield expr` is an expression, so you can assign it, return it, or
+pass it as an argument:
+
+```java
+assertEquals(List.of(2, 4), forj { x <- List.of(1, 2); } yield x * 2);
+```
+
+All generators in one block must use the same type. You can't mix a `List` generator with
+an `Optional` one; that's a compile error. Nested blocks can use different types.
+
+## What each type does
+
+### `Optional` — stop at the first empty step
+
+```java
+Optional<Integer> total = forj {
+    a <- parse("1");
+    b <- parse("x");     // empty, so the rest is skipped
+} yield a + b;           // Optional.empty()
+```
+
+### `List` — every combination
+
+```java
+List<String> pairs = forj {
+    n <- List.of(1, 2);
+    s <- List.of("a", "b");
+} yield s + n;           // [a1, b1, a2, b2]
+```
+
+Like a nested `for` loop. With `guard`, it works like a `for` loop with an `if`:
+
+```java
+List<List<Integer>> triples = forj {
+    a <- range(1, 20);
+    b <- range(a, 20);
+    c <- range(b, 20);
+    guard(a * a + b * b == c * c);
+} yield List.of(a, b, c);
+```
+
+Results are unmodifiable lists.
+
+### `Callable` — lazy steps, run on demand
+
+A comprehension over `Callable`s builds a bigger `Callable`. Nothing runs until you call it:
+
+```java
+Callable<String> dashboard = forj {
+    profile <- get("/profile/" + user);      // get returns Callable<String>
+    orders <- get("/orders/" + user);
+} yield combine(profile, orders);
+
+String json = dashboard.call();   // the requests happen here, one after another
+dashboard.call();                 // and again here
+```
+
+This is different from `CompletableFuture`, which starts working as soon as it's created.
+Steps run on the calling thread and simply block, which is cheap on a virtual thread.
+`examples/.../http/DashboardServer.java` is a complete server built this way.
+
+A failed `guard` makes `call()` throw `NoSuchElementException`.
+
+### Parallel calls with `Par`
+
+Generators always run one after another. To run calls at the same time, combine them with
+`forj.Par` and bind the combined result. Steps after it are sequential again, so a call that
+needs one of the parallel answers simply goes on the next line:
+
+```java
+record Parts(String profile, String orders, String recommendations) {}
+
+Callable<String> dashboard = forj {
+    parts <- Par.mapN(                                  // 1. three calls at once
+            get("/profile/" + user),
+            get("/orders/" + user),
+            get("/recommendations/" + user),
+            Parts::new);
+    shipping <- get("/shipping/" + itemCount(parts.orders()));   // 2. then one that needs the orders
+} yield render(parts, shipping);
+```
+
+With each call taking 200 ms, this takes about 400 ms: one round for the three parallel calls
+and one for shipping, instead of 800 ms for all four in a row. This is the example server in
+`examples/.../http/DashboardServer.java`.
+
+`Par` is still lazy: `Par.mapN` returns a `Callable`, and nothing starts until `call()`.
+Each call opens a `StructuredTaskScope`, runs every task on its own virtual thread, and
+waits for all of them. If one fails, the others are cancelled and `call()` throws that
+task's exception.
+
+| Method | Does |
+|---|---|
+| `Par.mapN(a, b, f)` (up to 4 tasks) | Runs the tasks in parallel, then combines the results with `f`. |
+| `Par.traverse(list, f)` | Runs `f` on every element in parallel; results keep the list's order. |
+| `Par.sequence(tasks)` | Runs a list of tasks in parallel; results keep the list's order. |
+
+`StructuredTaskScope` is a preview API in JDK 27 and 28, so forj builds with
+`--enable-preview`.
+
+## Adding your own types
+
+A comprehension over a type `M` needs a `given Monad<M>` (plus `FunctorFilter<M>` if it uses
+`guard`). How much more depends on whether you own `M`:
+
+- **You own it:** make it a `Kind` of itself, `final class Box<A> implements Kind<Box, A>`,
+  and declare `given Monad<Box> monad = ...` inside `Box`. Every caller finds it, no imports.
+- **You don't** (like `java.util.stream.Stream`): wrap it, and provide a `forjLift` overload
+  to wrap and a `@Lower` method to unwrap, next to the given:
+
+```java
+public final class StreamMonad {
+    record StreamK<A>(Stream<A> stream) implements Kind<Stream, A> {}
+
+    public static <A> Kind<Stream, A> forjLift(Stream<A> s) { return new StreamK<>(s); }
+
+    @Lower
+    public static <A> Stream<A> lowerStream(Kind<Stream, A> k) { return ((StreamK<A>) k).stream(); }
+
+    given Monad<Stream> monad = new Monad<>() { ... pure, flatMap ... };
+}
+```
+
+Callers `import static forj.examples.StreamMonad.*;` and write comprehensions over streams.
+The full example is `examples/.../StreamMonad.java`.
+
+## Higher-kinded types: `F<_>`
+
+Java can't say "some `F<A>` where `F` is itself a parameter". forj can: write `F<_>` where
+the type parameter is declared, then use `F<A>` like any generic type.
+
+```java
+interface Functor<F<_>> {                                    // F takes a type
+    <A, B> F<B> map(F<A> fa, Function<? super A, ? extends B> f);
+}
+
+static <F<_>> F<Integer> addBoth(F<Integer> a, F<Integer> b)(using Monad<F> m) {
+    return forj { x <- a; y <- b; } yield x + y;             // one comprehension, any monad
+}
+```
+
+Under the hood `F<A>` is `forj.Kind<F, A>`, and `F` is the raw class standing for the type
+constructor (`List`, `Optional`, `IO`). `addBoth` works for lists (every combination),
+optionals (both or nothing) and `IO` (one after the other, when run).
+
+Generic code is most useful when it asks for as little as it can. `examples/.../hkt/Generic.java`
+loosens `addBoth` one step at a time:
+
+```java
+// b doesn't depend on a's value, so Applicative is enough (no comprehension: those need Monad)
+static <F<_>> F<Integer> addIndependent(F<Integer> a, F<Integer> b)(using Applicative<F> ap) {
+    return ap.map2(a, b, Integer::sum);
+}
+
+// generic in the value too: "add" is whichever Semigroup<A> the call site finds
+static <F<_>, A> F<A> combineBoth(F<A> a, F<A> b)(using Applicative<F> ap, Semigroup<A> s) {
+    return ap.map2(a, b, s::combine);
+}
+
+// and in how many: run every F in a list (or optional, ...) and combine the results
+static <G<_>, F<_>, A> F<A> combineAll(G<? extends F<A>> fas)(using Traverse<G> t, Applicative<F> ap, Monoid<A> m)
+```
+
+`combineBoth` adds integers, concatenates strings and lists, and sums `Money`, all picked by
+the value type at compile time. `combineAll` of a `List<IO<Integer>>` is an `IO<Integer>`
+holding the total, and `empty()` (`0`) for an empty list. `forj.Instances` has monoids for
+`Integer` and `Long` (sum), `String` and `List` (concatenation); your own types bring theirs:
+`given Monoid<Money> sum = Monoid.of(new Money(0), ...)` inside `Money`.
+
+## Effects: `IO` and the capability ladder
+
+`forj.effect.IO<A>` is a lazy description of a computation that may perform side effects:
+
+```java
+IO<String> greeting = IO.delay(() -> readName()).map(n -> s"Hi $n");
+greeting.unsafeRunSync();          // runs now; each run starts over
+```
+
+It is stack safe (a million chained `flatMap`s are fine) and runs on virtual threads:
+`start()` runs it as a fiber you can `join` or `cancel`, `IO.race` keeps the first result and
+cancels the other, `IO.parMap2` runs two at once. `IO.bracket` releases a resource whether the
+use succeeds, fails or is cancelled.
+
+Generic code asks for capabilities, from the least to the most:
+
+| Type class | Adds | Example need |
+|---|---|---|
+| `Functor` | `map` | transform a result |
+| `Applicative` | `pure`, `map2` | combine independent results |
+| `Monad` | `flatMap` | the next step depends on the last (comprehensions) |
+| `MonadError<F, E>` | `raiseError`, `handleErrorWith`, `attempt` | fail and recover |
+| `Bracket<F, E>` | `bracket`, `guarantee` | release resources |
+| `Sync` | `delay`, `suspend` | wrap side effects |
+| `Async` | `async` | wait for a callback |
+| `Concurrent` | `start`, `race`, `parMap2` | do things at the same time |
+| `Effect` (extends `Async`) | `unsafeRunSync(fa)` | run an `F` at the edge, e.g. a server running a handler |
+| `ConcurrentEffect` | `Concurrent` + `Effect` | run an `F` that may do things at the same time |
+
+Beside the ladder: `FunctorFilter` (`filter`, for guards), `Foldable` (`foldLeft`,
+`combineAll`), `Traverse` (`traverse`, `sequence`), and for values `Semigroup` (`combine`) and
+`Monoid` (`combine` plus `empty`).
+
+Each extends the one above it (`Effect` branches off `Async`, and `ConcurrentEffect` joins it
+with `Concurrent`). `IO` has them all. `Callable` is an `Effect`, so it can be run and its
+`async` blocks until the callback fires, but it isn't `Concurrent`. Asking for a capability the
+effect doesn't have is a compile error.
+
+`Effect` runs an `F` with `unsafeRunSync(fa)`, or `runSync(fa)`, the same method under a
+plainer name (`IO` has both too). "Unsafe" doesn't mean dangerous: it marks the one call that
+performs the effects, where everything else only describes them. Use it once, at the edge
+of the program (a server running a request, `main`), never inside a `map` or `flatMap`.
+
+There's no callback-style `runAsync`, as in cats-effect 2,
+because blocking a virtual thread is cheap. To run something in the background, call
+`unsafeRunSync` on a virtual thread of its own; to cancel it, interrupt that thread.
+
+## Tagless final
+
+Describe what a program needs as small interfaces generic in `F` ("algebras"), write the
+program against those plus the capabilities it uses, and choose `F` only at the edge:
+
+```java
+public interface Inventory<F<_>> {
+    F<Integer> stock(String item);
+    F<Unit> reserve(String item, int quantity);
+}
+
+static <F<_>> F<Receipt> checkout(Order order)(using Sync<F> sync, Inventory<F> inventory, Payments<F> payments) {
+    return forj { ... } yield new Receipt(order, transaction);
+}
+```
+
+An interpreter implements the algebra for one effect, `class Warehouse implements
+Inventory<IO>`, whose methods can return `IO<Integer>` directly. At the edge, declare the
+interpreters as givens and ask for the type you want:
+
+```java
+given Inventory<IO> inventory = new Live.Warehouse(stock);
+given Payments<IO> payments = new Live.Bank();
+IO<Receipt> program = checkout(order);      // F = IO, inferred from the target
+```
+
+The target can be:
+- a typed local, a `return` or an assignment;
+- a `return` inside a lambda: in `Decoder<A> d = (body, strict) -> { return decode(body); };`
+  the target is `A`, the return type of the method the lambda implements;
+- either branch of `?:`, or an expression in parentheses: they get the whole expression's
+  target;
+- an argument: in `app.through(errors())` on an `HttpApp<IO>`, `through` takes a
+  `Middleware<IO>`, so `errors()` gets `F = IO`.
+
+forj doesn't infer across two generic calls (`describe(checkout(order))`, where `describe` is
+generic too). Give `F` there with a typed local or `checkout.<IO>(...)`.
+
+`examples/.../tagless/` runs the same `checkout` in `IO` and in plain `Callable`, and has
+`Ladder.java` with one function per capability level.
+
+## String interpolation
+
+Put values straight into a string, instead of `+` chains or `String.format`:
+
+```java
+String name = "ana";
+int total = 1250;
+
+s"Hi $name, you owe ${total / 100} dollars"   // "Hi ana, you owe 12 dollars"
+f"$name%-6s|${total / 100.0}%8.2f"             // "ana   |   12.50"
+raw"C:\temp\$name.txt"                        // C:\temp\ana.txt  (backslashes kept)
+```
+
+| Form | Does |
+|---|---|
+| `$name` | inserts a variable (letters, digits, `_`; a following `.x` stays text) |
+| `${expression}` | inserts any expression, including method calls and nested quotes |
+| `$$` | a literal `$` |
+| `s"..."` | joins the parts like `+` does; escapes like `\t` work as usual |
+| `f"..."` | `String.format`: put a format right after a value (`$price%.2f`); no format means `%s`; write `%%` for a literal `%` |
+| `raw"..."` | like `s`, but `\` is an ordinary character, handy for paths and regexes |
+
+Each interpolated string is a single expression: `s"ab$x".length()` works, and
+`s"${1}${2}"` is `"12"`, not `3`. Mistakes are compile errors:
+
+```
+forj: $ must be followed by a name, {expression} or $
+forj: write $$ for a literal $, not \$
+```
+
+and errors inside `${...}` point at the exact place in the expression.
+
+Not supported yet: triple-quoted (`s"""..."""`) multi-line strings, and checking `f` formats
+against the value types at compile time (Scala does; here a mismatch fails when it runs).
+
+## Type classes with `given` and `using`
+
+A *type class* is an interface describing something a type can do, like `Comparator`, but
+looked up by type instead of passed by hand. forj finds the right implementation at compile
+time.
+
+```java
+public interface Show<A> {
+    String show(A a);
+
+    given Show<Integer> integer = i -> Integer.toString(i);              // an instance
+
+    given <A> Show<List<A>> list(using Show<A> element) {                // built from another
+        return xs -> xs.stream().map(element::show).toList().toString();
+    }
+
+    static <A> String show(A a)(using Show<A> s) {                       // asks for one
+        return s.show(a);
+    }
+}
+
+Show.show(List.of(1, 2));   // "[1, 2]"
+```
+
+- **`given`** declares an instance. In a class it becomes a `public static` member (write
+  `private` or another modifier to change that). Annotations and access modifiers go before
+  the keyword: `@Deprecated private given Show<Integer> old = ...;`.
+- **`using`** declares parameters that callers leave out, in their own parentheses after
+  the ordinary ones, as in Scala 3: `f(A a)(using Show<A> s)`, or several:
+  `f(A a)(using Show<A> s, Ord<A> o)`. A caller can still pass them, which skips resolution:
+  `show(a)(using hexShow)`.
+- **Plain-Java alternative:** `@Using` on the parameters and `@Given` on the instances
+  (`import forj.Given; import forj.Using;`). It's what the keywords compile to, so it behaves
+  the same, but it's ordinary Java: editors without forj support parse it without errors
+  (they only flag calls that leave the arguments out).
+
+  ```java
+  static <A> String show(A a, @Using Show<A> s) { ... }      // = show(A a)(using Show<A> s)
+  @Given public static final Show<Integer> integer = ...;    // = given Show<Integer> integer = ...;
+  ```
+- **At each call** the plugin works out the type the parameter needs (`Show<List<Integer>>`
+  above), finds a given for it, and passes it: here `Show.list(Show.integer)`. If none
+  exists, or two do, the build fails:
+
+  ```
+  forj: no given Show<java.time.Instant> for show
+  forj: ambiguous givens for Show<java.lang.Integer>: [Report.natural, Report.reversed]
+  ```
+
+  (javac then adds its own "cannot be applied" error for the same call.)
+
+### Which given is picked
+
+There can be many givens of the same type: `Show.integer` next to the type class, a
+`given Show<Integer> hex` in some method, another in a class. The plugin picks by two
+things, in order:
+
+1. **The type.** Only givens of exactly the required type count. `Show.show(42)` needs a
+   `Show<Integer>`, so `Show<String>` and `Show<Money>` givens are never considered.
+2. **The nearest scope.** Among those, the closest one wins:
+
+| Level | Where | Example |
+|---|---|---|
+| 1 | a local `given` declared earlier in the block | `given Show<Integer> hex = ...;` then `Show.show(255)` gives `0xff` |
+| 2 | the enclosing method's `using` parameters | generic code uses whatever its caller had |
+| 3 | givens in the enclosing classes | `Accounting.ledger` formats money inside `Accounting` |
+| 4 | givens brought in with `import static` | `import static ...Euro.*;` formats money in euros |
+| 5 | givens next to the type class or the data type | `Show.integer`, `Money.show`: the defaults, found without imports |
+
+Two matches at the *same* level is a compile error, never a guess.
+
+All of these are runnable in `examples/.../typeclasses/Resolution.java` and
+`ImportedGivens.java`, with the expected output in `ResolutionTest`:
+
+```java
+// by type: three different instances for three types
+Show.show(42);                  // "42"      Show.integer
+Show.show("hi");                // "\"hi\""   Show.string
+Show.show(new Money(150));      // "$1.50"   Money.show
+
+// derived instances pick each element's instance
+Show.show(List.of(1, 2));                       // "[1, 2]"          Show.list(Show.integer)
+Show.show(List.of(new Money(100)));             // "[$1.00]"         Show.list(Money.show)
+
+// a local given beats the default, inside its block only
+static String localGiven() {
+    given Show<Integer> hex = i -> "0x" + Integer.toHexString(i);
+    return Show.show(255);                       // "0xff"
+}
+static String withoutLocalGiven() {
+    return Show.show(255);                       // "255"
+}
+
+// ...and it flows into derived instances
+given Show<Integer> hex = ...;
+Show.show(List.of(10, 11));                      // "[0xa, 0xb]"      Show.list(hex)
+
+// generic code uses its caller's instance
+static <A> String twice(A a)(using Show<A> show) { return Show.show(a) + " " + Show.show(a); }
+
+twice(7);                                        // "7 7"             twice(7, Show.integer)
+given Show<Integer> roman = i -> i == 7 ? "VII" : "?";
+twice(7);                                        // "VII VII"         twice(7, roman)
+
+// a class-level given beats the data type's own
+final class Accounting {
+    given Show<Money> ledger = m -> ...;
+    static String report() { return Show.show(new Money(-420)); }   // "(420c)", not "$-4.20"
+}
+
+// an imported given beats the data type's own
+import static forj.examples.typeclasses.Euro.*;
+Show.show(new Money(1999));                      // "€19,99"          Euro.euros
+
+// passing it yourself always wins: nothing is looked up
+Show.show(3, stars);                             // "***"
+```
+
+And when it can't decide:
+
+```java
+final class Report {
+    given Show<Integer> natural = i -> ...;
+    given Show<Integer> padded = i -> ...;
+    static String r() { return Show.show(1); }
+}
+// forj: ambiguous givens for ...Show<java.lang.Integer>: [Report.natural, Report.padded]
+```
+
+To get an instance directly: `Implicits.<Show<Integer>>summon()`. Instances in compiled
+libraries are found too.
+
+## Deriving instances: `derives`
+
+A record can ask for type class instances instead of writing them by hand:
+
+```java
+record User(long id, String name, Instant joined) derives Codec, Show { }
+
+Codec<User> c = User.codec;     // a given named after the type class
+```
+
+For each type class, the record gets a `given` (`User.codec`, `User.show`) built from its
+components. Each component's instance is resolved like any `using` argument, so givens in scope
+apply to it: a `given Codec<Instant>` with a custom format in an enclosing class wins over the
+default. A record that contains another derived record uses that record's given. A component
+without an instance is a compile error naming the missing one:
+`forj: no given forj.json.Codec<java.time.Instant>`.
+
+- **Generic records** get a given *method*: `record Box<A>(A value) derives Codec` gives
+  `<A> Codec<Box<A>> codec(using Codec<A>)`, so `Codec<Box<String>>` is found whenever
+  `Codec<String>` is.
+- **Plain Java:** `@forj.Derives({Codec.class, Show.class}) record User(...) { }` is the same
+  thing, and parses in any editor.
+- **The clause** goes after the components and any `implements`:
+  `record Point(int x, int y) implements Comparable<Point> derives Show { ... }`.
+
+### What a type class provides
+
+forj knows nothing about JSON or text. It only uses a naming convention on the type class
+named in `derives X` (found through your imports like any name):
+
+| Convention | Required | What forj generates |
+|---|---|---|
+| `static <T, F> ... field(String name, Function<T, F> getter)(using X<F>)` and `static <T> X<T> product(Function<Object[], T> constructor, ...fields)` | yes | `X.<User>product((Object[] a) -> new User((long) a[0], ...), X.<User, Long>field("id", (User r) -> r.id()), ...)` |
+| `static <T> X<T> deriveProduct(constructor, encoder, ...fields)` plus `deriveField(out, index, value)` overloads | optional | the encoder as straight-line code: `X.deriveField(out, 0, u.id()); X.deriveField(out, 1, u.name()); ...` |
+
+The second form is for speed. javac's overload resolution picks the `deriveField` for each
+component's type, so a library can offer `deriveField(Out, int, long)` and `deriveField(Out, int,
+String)` (no boxing, no loop, no function objects) plus one generic
+`<A> deriveField(Out, int, A)(using X<A>)` for everything else. `Out` is whatever type the
+library's encoder takes; forj reads it from `deriveProduct`'s signature. A type class without
+`deriveProduct` just gets the first form.
+
+Limits for now:
+- only records;
+- the specialized form is for non-generic records (generic ones use `product`);
+- a record that contains itself (`record Tree(List<Tree> kids)`) isn't supported yet, because
+  its given would read itself while it's still being built.
+
+## Extension methods
+
+`extension` declares a static method you can call as if it were a method of its first
+parameter's type:
+
+```java
+public interface Show<A> {
+    String show(A a);
+    extension <A> String show(A a)(using Show<A> s) { return s.show(a); }
+}
+
+import static forj.examples.typeclasses.Show.*;
+money.show()          // the plugin calls Show.show(money, Money.show)
+```
+
+When `x.name(...)` doesn't match a method `x`'s type has, the plugin looks for an extension
+method named `name` whose first parameter takes `x`, nearest first:
+
+| Order | Where | Example |
+|---|---|---|
+| 1 | the enclosing classes | a helper in the same class |
+| 2 | `import static` | `import static lib.Show.*;` |
+| 3 | the type classes of givens in scope (local givens, the method's `using` parameters) | `a.show()` inside `f(A a)(using Show<A> s)` |
+| 4 | the receiver's class and its type arguments' classes | `extension String pretty(Money m)` inside `Money` |
+| 5 | `forj.Syntax` | `fa.map(f)` on any `F<A>` |
+
+A method the type really has always wins: `optional.map(f)` is `Optional.map`. Extension
+methods take `using` parameters like any other method, so instances are resolved as usual.
+
+`forj.Syntax` turns the type classes into methods on any `F<A>`: `map`, `as`, `voided`,
+`map2`, `flatMap`, `productR`, `flatten`, `filter`, `handleErrorWith`, `handleError`,
+`attempt`, `guarantee`, `start`, `race`, `parMap2`, `foldLeft`, `combineAll`, `sequence`, and
+`combine` on any value with a `Semigroup`. Generic code reads like code on a concrete type:
+
+```java
+static <F<_>, A> F<A> retry(F<A> attempt, int times)(using MonadError<F, Throwable> errors) {
+    return times <= 1 ? attempt : attempt.handleErrorWith(e -> retry(attempt, times - 1));
+}
+```
+
+Asking for a capability the effect doesn't have is still a compile error:
+`callable.filter(p)` gives `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
+Annotations and access modifiers go before the keyword, as on any method:
+`@Deprecated(forRemoval = true) extension <A> String shout(A a)(using Show<A> s)`. The
+plain-Java spelling is `@Extension public static`.
+
+## Automatic lifting (opt-in)
+
+JDK types like `Callable`, `List` and `Optional` aren't a `Kind`, so code generic in `F`
+normally needs them wrapped (`new CallableK<>(c)`) and unwrapped (`CallableK.narrow(k)`). Three
+opt-in features let the plugin do it, switched on per file with a static import, like Scala's
+`import scala.language.x`:
+
+```java
+import static forj.Language.liftResults;     // or liftReceivers, liftArguments
+import static forj.Language.lifting;         // all three
+```
+
+| Feature | Without it | With it |
+|---|---|---|
+| `liftResults` | `Kind<Callable, User> u = Json.decodeF(bytes);` | `Callable<User> u = Json.decodeF(bytes);`: `F` is inferred from the JDK type, and the value unwrapped |
+| `liftReceivers` | `new ListK<>(xs).map(f)` | `xs.map(f)` |
+| `liftArguments` | `addBoth(new CallableK<>(a), new CallableK<>(b))` | `addBoth(a, b)` |
+
+They compose, so with `lifting` this works end to end:
+
+```java
+List<Integer> doubled = List.of(1, 2, 3).map(x -> x * 2).filter(x -> x > 2);   // [4, 6]
+```
+
+The wrapping uses the same `forjLift` overloads and `@Lower` methods as comprehensions, so a
+library type that supports `forj { }` (see "Adding your own types") lifts too, once its class
+is statically imported.
+
+**What to keep in mind** (the reason it's opt-in):
+- **It's silent.** A method or extension that expects an `F<A>` accepts a JDK value whenever a
+  `forjLift` exists for its type, and a result assigned to a JDK type is unwrapped. Nothing at
+  the call site shows the conversion.
+- **A type's own method still wins.** `optional.map(f)` is `Optional.map`, not `Syntax.map`.
+  Lifting only applies when the type has no method of that name.
+- **Where it applies:**
+  - `liftResults`: typed locals, `return` and assignments (the same places `F` is inferred
+    from), not inside expression lambdas or `var` locals;
+  - `liftArguments`: methods with `using` parameters only. A method that takes a `Kind` but no
+    `using` parameter gets no lifting;
+  - an argument whose type isn't known yet, such as an implicit lambda (`addBoth(() -> 1, ...)`),
+    isn't lifted. Give it a type first (`Callable<Integer> one = () -> 1;`).
+- **Ambiguity:** a value that more than one `forjLift` accepts (a class that is both a `List`
+  and a `Callable`) isn't lifted, and you get javac's usual error.
+- **Chains need `liftResults` to come back:** `xs.map(f)` with only `liftReceivers` is a
+  `Kind<List, B>`; assigning it to a `List<B>` needs `liftResults` too (or `lifting`).
+- **Cost:** one wrapper object per lift, the same as writing `new ListK<>(...)` by hand.
+- **Capabilities are still checked:** `callable.filter(p)` is still
+  `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
+
+## Context parameters: passing things through without passing them
+
+`using` isn't only for type classes. It also carries context that a lot of code needs and
+nobody wants to thread by hand: the current request, a trace ID, a transaction. The dashboard
+example sends the caller's trace ID to every downstream service:
+
+```java
+public record RequestContext(String traceId) { ... }
+
+// the handler declares it once
+private void dashboard(HttpExchange exchange) {
+    given RequestContext request = RequestContext.from(exchange);
+    respond(exchange, 200, dashboard(user).call());          // `request` passed for us
+}
+
+// everything below asks for it instead of taking it as an argument
+Callable<String> dashboard(String user)(using RequestContext request) {
+    return forj {
+        parts <- Par.mapN(get("/profile/" + user), get("/orders/" + user),
+                          get("/recommendations/" + user), Parts::new);
+        shipping <- get("/shipping/" + itemCount(parts.orders()));
+    } yield ...;
+}
+
+private Callable<String> get(String path)(using RequestContext request) {
+    return () -> ... .header("X-Trace-Id", request.traceId()) ...;
+}
+```
+
+`DashboardServerTest` checks all four downstream calls, including the three parallel ones,
+arrive with the caller's trace ID.
+
+Compared with Java's `ScopedValue`, which does a similar job at runtime:
+
+- **Checked at compile time.** If a call needs a `RequestContext` and none is in scope, the
+  build fails. A `ScopedValue` that isn't bound fails when the code runs.
+- **Works with lazy code.** The context is an ordinary argument, captured when the `Callable`
+  is built. A `ScopedValue` must still be bound when `call()` runs, which is easy to get
+  wrong with lazy tasks.
+- **Visible in signatures.** `using RequestContext request` says what a method needs.
+
+## Things that may surprise you
+
+- **Every generator ends with `;`.** `x <- xs` without a semicolon is not recognised.
+- **Guards go directly after a generator.** `x <- xs; var y = x * 2; guard(y > 2);` is an
+  error. Put the condition on `x` instead: `guard(x * 2 > 2);`.
+- **Generators must be top-level statements** of the block, not inside `if` or loops.
+- **Names behave like lambda parameters**, because that's what they become. You can't
+  reuse a name that's already a local variable in the enclosing method, and you can't
+  reassign a bound name.
+- **Don't write `return` inside the block.** The result goes after it, in `yield`.
+- **`yield` inside the block is an error**, except inside a `switch` expression, where it
+  means what it always means.
+- **Editors show red.** IntelliJ and VS Code don't know the syntax yet, so they flag it.
+  The Mill build is the source of truth.
+- **Overloads with `using` parameters are picked by their ordinary arguments.**
+  `decode(byte[])(using Codec<A>)` next to `decode(InputStream)(using Codec<A>)` is fine.
+  When several accept the arguments, the most specific wins, as in javac: `json(A value)` next
+  to `json(Request request)` picks `json(Request)` for a `Request` and `json(A)` for anything
+  else. Overloads that only differ where the argument's type isn't known yet (an implicit
+  lambda) are still ambiguous.
+- **A `using` clause after varargs moves in front of them.** javac wants the varargs
+  parameter last, so `of(Route<F>... routes)(using Applicative<F> ap)` compiles to
+  `of(Applicative<F> ap, Route<F>... routes)`. forj callers don't notice. Plain Java callers
+  and reflection see the instance first.
+- **A local named like a package** (`byte[] forj = ...;`) doesn't break generated code: where
+  one is in scope, forj calls through `((forj.Syntax) null).map(...)` instead of
+  `forj.Syntax.map(...)`. With `-Xlint:static`, javac warns about that call.
+- **With annotation processors** (Lombok, JMH, MapStruct, ...), the build must put the forj
+  plugin on the processor path too, or javac reports `plug-in not found: Forj`. The
+  `ForjModule` in the README ("Using forj from another build") does that.
+
+## Error messages
+
+forj reports its own errors with a `forj:` prefix, pointing at your code:
+
+```
+forj: guard(...) must directly follow a generator (x <- ...) or another guard(...)
+forj: x <- ... must be a top-level statement of a forj { ... } block
+forj: forj { ... } must be followed by yield <expr>
+forj: yield goes after the block: forj { ... } yield expr
+```
+
+Missing instances are reported by type: `forj: no given forj.typeclass.Monad<...>` means no
+given provides that capability for the type. Using a type forj can't lift at all (no
+`forjLift` overload and not a `Kind`) shows up as a javac error about `forjLift`.
+
+## Seeing what it generates
+
+In Mill, set `def forjDebug = true` on the module, or pass `-Xplugin:"Forj debug"` to javac.
+Each comprehension is printed after desugaring:
+
+```
+[forj] Examples.java:41
+forjLower(forj.For.forjFlatMap(forjLift(findUser(name)), (user)->{
+    return forj.For.forjFlatMap(forjLift(user.managerName()), (manager)->{
+        return forj.For.forjMap(forjLift(findAddress(manager)), (address)->{
+            return address.city();
+            ...
+```
+
+The instance arguments (`forj.Instances.optional`) and type arguments are added afterwards,
+once javac knows the types.

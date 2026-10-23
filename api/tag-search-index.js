@@ -1,0 +1,1 @@
+tagSearchIndex = [{"l":"Constant Field Values","h":"","k":"18","u":"constant-values.html"},{"l":"Lifting","h":"class forj.For","k":"16","u":"forj/For.html#lifting-heading"},{"l":"Lifting","h":"class forj.Language","k":"16","u":"forj/Language.html#lifting-heading"}];updateSearchResults();

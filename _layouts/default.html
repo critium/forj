@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% if page.title and page.title != site.title %}{{ page.title }} · {% endif %}forj</title>
+<link rel="stylesheet" href="/readme.css">
+<script src="/nav.js" defer></script>
+</head>
+<body>
+<nav class="tabline"><a href="{{ site.baseurl }}/"{% if page.url == "/" %} class="active"{% endif %}>README.md</a> <a href="{{ site.baseurl }}/docs/"{% if page.url contains "/docs/" %} class="active"{% endif %}>docs</a> <a href="{{ site.baseurl }}/api/">api</a> <a href="{{ site.baseurl }}/examples/">examples</a> <span class="fill"></span><a class="right" href="https://critium.github.io/">critium</a> <a class="right" href="https://github.com/critium/forj">github</a></nav>
+<main>
+{{ content }}
+</main>
+</body>
+</html>

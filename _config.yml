@@ -1,0 +1,4 @@
+title: forj
+defaults:
+  - scope: { path: "" }
+    values: { layout: default }

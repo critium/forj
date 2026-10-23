@@ -1,0 +1,256 @@
+# forj
+
+Scala-style for comprehensions for Java, as a javac plugin. Your files stay `.java`.
+
+```java
+Optional<String> city = forj {
+    user <- findUser(name);
+    manager <- user.managerName();
+    address <- findAddress(manager);
+} yield address.city();
+```
+
+That compiles to the nested calls you would otherwise write by hand:
+
+```java
+findUser(name).flatMap(user ->
+    user.managerName().flatMap(manager ->
+        findAddress(manager).map(address -> address.city())));
+```
+
+## What's in it
+
+**<ins>Comprehensions</ins>** with generators, `guard` filters, value definitions and `_ <-`,
+over any `F` with a `Monad<F>`: `Optional`, `List`, `Callable`, forj's `IO`, or a type
+parameter.
+
+**<ins>`given` and `using`</ins>**: Scala 3 type classes and context parameters, resolved at
+compile time.
+
+```java
+given Show<Integer> integer = i -> Integer.toString(i);
+static <A> String show(A a)(using Show<A> s) { return s.show(a); }
+```
+
+**<ins>Extension methods</ins>**: `fa.map(f)`, `fa.flatMap(f)`, `fa.race(fb)` on any `F`.
+
+**<ins>Derived instances</ins>**: `record User(long id, String name) derives Codec { }`.
+
+**<ins>Higher-kinded types</ins>**: `F<_>` type parameters and the cats-effect 2 ladder, for
+tagless final.
+
+**<ins>Parallel calls</ins>**: `forj.Par`, `parMapN`-style, on structured concurrency.
+
+**<ins>String interpolation</ins>**: `s"Hi $name"`, `f"$price%.2f"`, `raw"C:\$file"`.
+
+## Want to dig deeper?
+- New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
+- Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
+- API reference: [javadoc for forj-core](https://critium.github.io/forj/api/), and the
+  [examples](https://critium.github.io/forj/examples/).
+
+## How it works
+
+`forj { ... } yield e` isn't valid Java, so the plugin works in two stages inside javac:
+
+1. **Before parsing**, it rewrites the source text into Java that javac can parse:
+   `forj {` becomes `forj (() -> {`, `x <- e;` becomes `x =  e;`, and `} yield e` moves
+   inside the block. No lines are added or removed, and after parsing every position is
+   mapped back to your original file, so errors, stack traces and debuggers point at the
+   code you wrote.
+2. **After parsing, before type checking**, it desugars each block the way scalac does:
+   every generator but the last becomes `forjFlatMap`, the last becomes `forjMap`, and
+   guards become `forjFilter`: methods that take the `Monad<F>` (or `Functor<F>`,
+   `FunctorFilter<F>`) instance as a `using` parameter. javac then type checks the result as
+   ordinary Java.
+3. **Just before javac type checks each class**, it fills in `using` arguments that calls
+   leave out. It type checks copies of the call's arguments to infer the method's type
+   parameters, searches for a `given` of each required type (recursively, for givens that
+   have `using` parameters of their own), and inserts it. No match, or two, fails the build.
+
+The runtime library is small: `forj.For` holds what comprehensions call, `forj.Instances`
+the instances for JDK types, `forj.Syntax` the default extension methods, and `forj.Par` the
+parallel combinators.
+
+## Building
+
+Requirements: macOS or Linux. Everything else is fetched for you.
+
+```sh
+bin/fetch-jdk        # downloads the pinned JDK (28 early access) into .jdk/
+./mill __.test       # builds the plugin and runs all tests
+./mill examples.runMain forj.examples.http.DashboardServer   # example HTTP server on :8080
+curl localhost:8080/dashboard/ana
+```
+
+The example server shows lazy, parallel and sequential steps together. Three calls run in
+parallel, then a fourth that needs one of their answers:
+
+```java
+Callable<String> dashboard = forj {
+    parts <- Par.mapN(get("/profile/" + user), get("/orders/" + user), get("/recommendations/" + user), Parts::new);
+    shipping <- get("/shipping/" + itemCount(parts.orders()));
+} yield render(parts, shipping);
+```
+
+The build uses [Mill](https://mill-build.org). The plugin reaches into javac internals,
+so every module compiles with the exact JDK in `.jdk/`, and any JVM that runs javac with the
+plugin needs the `--add-exports`/`--add-opens` flags listed in `build.mill`
+(`pluginJvmOptions`).
+
+The whole project uses Java preview features (`StructuredTaskScope` is preview in JDK 27
+and 28). javac gets `--enable-preview --source 28`, and every JVM runs from `.jdk/preview`,
+a mirror of the JDK whose `java` launcher always adds `--enable-preview`
+(`bin/make-preview-jdk`). That way even the JVMs Mill starts without our flags, such as its
+test discovery step, have preview on.
+
+To use forj in a module, mix in `ForjModule`:
+
+```scala
+object app extends ForjModule
+```
+
+Set `def forjDebug = true` to print each desugared comprehension during compilation.
+
+### Using forj from another build
+
+`./mill __.publishM2Local` publishes `forj:forj-core` (the runtime) and `forj:forj-plugin`
+(compile time only) as `0.1.0-SNAPSHOT` to `~/.m2`. A downstream Mill module then looks like
+this (`bin/check-publish` builds and runs exactly this against the published jars):
+
+```scala
+trait ForjModule extends JavaModule {
+  // forj's class files are preview class files for this exact JDK
+  def javaHome = Task.Input { Some(PathRef(os.Path("/path/to/forj/.jdk/preview"), quick = true)) }
+  def repositories = super.repositories() ++ Seq("m2Local")
+  def mvnDeps = super.mvnDeps() ++ Seq(mvn"forj:forj-core:0.1.0-SNAPSHOT")
+  def compileMvnDeps = super.compileMvnDeps() ++ Seq(mvn"forj:forj-plugin:0.1.0-SNAPSHOT")
+  def jvmOptions = super.jvmOptions() ++ forjCompilerJvmOptions   // pluginJvmOptions in build.mill
+  def javacOptions = super.javacOptions() ++ Seq("--enable-preview", "--source", "28", "-Xplugin:Forj")
+  // With annotation processors (JMH, Lombok, ...), javac loads plugins from the processor
+  // path only, not the classpath, so the forj plugin goes there too (otherwise:
+  // "plug-in not found: Forj").
+  def annotationProcessorsResolvedMvnDeps = Task {
+    val processors = super.annotationProcessorsResolvedMvnDeps()
+    if (processors.isEmpty) processors
+    else processors ++ compileClasspath().filter(_.path.last.startsWith("forj-plugin-"))
+  }
+  // javadoc parses sources without the plugin, so it reads them as the plugin's text stage
+  // rewrites them (F<A> as forj.Kind<F, A>, using clauses as @forj.Using parameters)
+  def forjExportedSources = Task {
+    val plugin = compileClasspath().filter(_.path.last.startsWith("forj-plugin-")).map(_.path)
+    os.proc(
+      javaHome().get.path / "bin" / "java", forjCompilerJvmOptions,
+      "-cp", plugin.mkString(java.io.File.pathSeparator),
+      "forj.plugin.ExportSources", Task.dest, allSources().map(_.path)
+    ).call(stdout = os.Inherit)
+    PathRef(Task.dest)
+  }
+  def docSources = Task { Seq(forjExportedSources()) }
+  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on;
+  // the look is critium.github.io's (docStyle below)
+  def javadocOptions = Task {
+    super.javadocOptions() ++ Seq("--enable-preview", "--source", "28") ++
+      docStyle.stylesheet().toSeq.flatMap(css => Seq("--add-stylesheet", css.path.toString))
+  }
+}
+
+/**
+ * The docs' look lives on critium.github.io (javadoc.css and the palette.css it imports), shared
+ * by every critium repo's docs. Builds take a copy, palette inlined, because a javadoc jar is
+ * read offline; docs hosted on Pages load it live instead (bin/publish-docs).
+ *
+ * FORJ_DOCS_STYLE=<checkout of critium.github.io> uses a local copy, to try a change before
+ * publishing it. Unreachable (offline): javadoc's own look, with a warning.
+ */
+object docStyle extends Module {
+  def site = "https://critium.github.io"
+
+  def css: T[Option[String]] = Task.Input {
+    def read(name: String): Option[String] = Task.env.get("FORJ_DOCS_STYLE") match {
+      case Some(dir) => Some(os.Path(dir, BuildCtx.workspaceRoot) / name).filter(os.exists(_)).map(os.read(_))
+      case None =>
+        try {
+          val r = requests.get(s"$site/$name", connectTimeout = 3000, readTimeout = 5000, check = false)
+          if (r.statusCode == 200) Some(r.text()) else None
+        } catch { case _: Exception => None }
+    }
+    val found = for (javadoc <- read("javadoc.css"); palette <- read("palette.css"))
+      yield {
+        // palette.css inlined; browsers ignore an @import after a rule, so imports go first
+        val lines = javadoc.replace("@import url(\"palette.css\");", palette).linesIterator.toSeq
+        val (imports, rules) = lines.partition(_.trim.startsWith("@import"))
+        (imports ++ rules).mkString("", "\n", "\n")
+      }
+    if (found.isEmpty) Task.log.warn(s"forj: no docs stylesheet from ${Task.env.getOrElse("FORJ_DOCS_STYLE", site)}; javadoc's default look")
+    found
+  }
+
+  /** Written under its content hash: Mill reruns javadoc when its options change, not a file's. */
+  def stylesheet: T[Option[PathRef]] = Task {
+    css().map { text =>
+      val file = Task.dest / Integer.toHexString(text.hashCode) / "javadoc.css"
+      os.write(file, text, createFolders = true)
+      PathRef(file)
+    }
+  }
+}
+```
+
+The recipe needs `import mill.api.BuildCtx` at the top of `build.mill`, for `docStyle`. The plugin jar carries its `META-INF/services` entry, so nothing else is needed. The javadoc
+jar documents each declaration as plain Java callers see it: `F<A>` appears as
+`forj.Kind<F, A>`, and a `using` instance as an ordinary parameter. Consumers must
+compile and run on the same JDK build with `--enable-preview`: the jars hold preview class
+files.
+
+### API docs
+
+`bin/publish-docs` builds the Pages site and prints where; `bin/publish-docs --push`
+force-pushes it to the `gh-pages` branch, served at https://critium.github.io/forj/:
+- this README is the front page, with `docs/` next to it;
+- the javadoc of `core` is at `api/`, and of `examples` at `examples/`;
+- a tab bar on every README page links them.
+
+Other critium repos copy the script and change its `MODULES` and `PAGES` lines.
+
+The look lives on [critium.github.io](https://github.com/critium/critium.github.io), in
+`javadoc.css` and the `palette.css` it shares with the site:
+- **Hosted docs** load it live (`javadoc.css`, and `readme.css` for the README pages), so a
+  change there restyles every repo's docs.
+- **Javadoc jars** get a copy at build time (`docStyle` in `build.mill`), because jars are read
+  offline. If the site can't be reached, they use javadoc's default look, with a warning.
+- **To try a style change** before publishing it, set `FORJ_DOCS_STYLE` to a checkout of the
+  site, for example `FORJ_DOCS_STYLE=../critium.github.io bin/publish-docs`.
+
+## Project layout
+
+| Path | What it is |
+|---|---|
+| `core/` | `forj.Kind` and the type class ladder (`forj.typeclass`), the `IO` effect (`forj.effect`), instances for JDK types (`forj.Instances`), what comprehensions compile to (`forj.For`), `forj.Par`, `@Given`/`@Using`/`@Lower`. No dependencies. |
+| `plugin/` | The javac plugin: `SourceRewriter` and `Interpolations` (text stage), `Desugarer` (forj blocks) and `Deriver` (`derives`) at parse time, `ImplicitResolver` (`given`/`using`) with `Extensions`, `Lifting` and `DerivationSpecializer` before type checking, and the glue that installs them into javac. |
+| `AGENTS.md` | How to read and write forj code, and how the plugin is put together, for coding agents (`CLAUDE.md` imports it). |
+| `examples/` | Example code and tests: a third-party monad (`StreamMonad`), a small HTTP server (`http/`), type classes with `given`/`using` (`typeclasses/`), generic code over any `F` and any value type: `Monad`, `Applicative`, `Semigroup`/`Monoid`, `Traverse` (`hkt/`), and tagless final with two interpreters (`tagless/`). |
+| `bin/fetch-jdk` | Downloads and verifies the pinned JDK, then runs `bin/make-preview-jdk`. |
+| `TODO.md` | Known issues and planned work. |
+
+## Status and limitations
+
+This is an experiment. It works and is tested, but:
+
+- **Editors show errors.** IntelliJ, VS Code and Metals parse `.java` files without the
+  plugin, so they mark `forj { }`, `<-` and `yield` as syntax errors and have no completion
+  inside forj blocks. Builds are unaffected. Editor plugins are in `TODO.md`.
+- **Metals indexing** (go-to-definition, find-references) currently fails on files that use
+  forj, because of an interaction with the semanticdb plugin. Investigation notes are in
+  `TODO.md`.
+- **Tied to javac internals.** The plugin swaps javac's parser factory and edits its trees,
+  so it targets one JDK at a time (currently JDK 28 early access).
+- **Preview features.** Code using forj is compiled and run with `--enable-preview`.
+- **Wrapping cost for JDK types.** Comprehensions always go through the `Monad<F>` type
+  class, so `List`, `Optional` and `Callable` values are wrapped: about 3-4 ns per step,
+  invisible next to real work (+3% for a 100×100 `List`), noticeable only in hot loops of
+  tiny `Optional` chains. `IO` implements `Kind` itself and pays nothing.
+
+## License
+
+Apache License 2.0; see [LICENSE](https://github.com/critium/forj/blob/main/LICENSE). Contributions are accepted under the same license.

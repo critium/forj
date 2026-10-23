@@ -1,0 +1,1 @@
+packageSearchIndex = [{"l":"All Packages","u":"allpackages-index.html","k":"18"},{"l":"forj"},{"l":"forj.data"},{"l":"forj.effect"},{"l":"forj.typeclass"}];updateSearchResults();
