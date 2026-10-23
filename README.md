@@ -56,6 +56,7 @@ f"$item%-10s $price%8.2f"                  // String.format("%-10s %8.2f", item,
 raw"C:\temp\$file"                         // backslashes stay backslashes
 ```
 
+## Want to dig deeper but not too deep?
 - New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
 - Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
 - API reference: [javadoc for forj-core](https://critium.github.io/forj/api/), and the
