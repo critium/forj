@@ -30,11 +30,13 @@ public final class Examples {
 
     /**
      * Scala:
+     * <pre>{@code
      *   for {
      *     user    <- findUser(name)
      *     mgrName <- user.managerName
      *     address <- findAddress(mgrName)
      *   } yield address.city
+     * }</pre>
      */
     public static Optional<String> managersCity(String name) {
         return forj {
@@ -46,12 +48,14 @@ public final class Examples {
 
     /**
      * Scala:
+     * <pre>{@code
      *   for {
      *     a <- 1 to n
      *     b <- a to n
      *     c <- b to n
      *     if a*a + b*b == c*c
      *   } yield (a, b, c)
+     * }</pre>
      */
     public static List<List<Integer>> pythagoreanTriples(int n) {
         return forj {
