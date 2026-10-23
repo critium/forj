@@ -52,6 +52,23 @@ done
 for page in "${PAGES[@]}"; do
   if [ -e "$page" ]; then cp -R "$page" "$WORK/"; fi
 done
+# a folder of guides gets an index listing them by title, so /<repo>/<folder>/ is a page too
+for page in "${PAGES[@]}"; do
+  dir="$WORK/$page"
+  if [ -d "$dir" ] && [ ! -e "$dir/index.md" ] && [ ! -e "$dir/README.md" ]; then
+    {
+      # front matter, so Jekyll renders it for sure (index.md without it was skipped)
+      printf -- '---\ntitle: %s\n---\n\n' "$page"
+      echo "# $page"
+      echo
+      for md in "$dir"/*.md; do
+        [ -e "$md" ] && [ "$(basename "$md")" != index.md ] || continue
+        title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
+        echo "- [${title:-$(basename "$md" .md)}]($(basename "$md"))"
+      done
+    } > "$dir/index.md"
+  fi
+done
 
 # Jekyll lays out the markdown with this; javadoc's HTML has no front matter, so it is served
 # as it is
