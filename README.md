@@ -207,6 +207,8 @@ trait ForjModule extends JavaModule {
     PathRef(Task.dest)
   }
   def docSources = Task { Seq(forjExportedSources()) }
+  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on
+  def javadocOptions = super.javadocOptions() ++ Seq("--enable-preview", "--source", "28")
 }
 ```
 

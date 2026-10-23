@@ -128,6 +128,17 @@ forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on
     happens after parsing).
   - forj-http can replace its placeholder javadoc jar with the recipe's
     `forjExportedSources`/`docSources`.
+  - **Fixed (found in forj-codec, 2026-10-22): the downstream recipe needed
+    `javadocOptions`.** Some forj-core classes are preview class files (`IO`, `For`, `Par`,
+    `Instances`, `forj.data.Either`; `Kind` and the type classes aren't), and javadoc reads
+    them only with `--enable-preview --source 28`. The README recipe and `bin/check-publish`
+    now set it, and check-publish's `app` documents a signature with `IO` in it.
+  - **Fixed (found in forj-codec): `{@link}` to a method with a `using` clause.** Authors
+    write `{@link #encode(Object, OutputStream)}`, which didn't resolve against the exported
+    signature. `ExportSources` now appends the using parameters' types to `{@link}`,
+    `{@linkplain}` and `@see` references that name such a method by its ordinary parameters,
+    including `Other#m(...)` links from other files (`ExportSourcesTest`). Links that already
+    list every parameter, or match no such method or more than one, stay as written.
 
 ## Enforce a coding style (2-space indentation)
 

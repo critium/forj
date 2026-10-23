@@ -55,6 +55,8 @@ trait ForjModule extends JavaModule {
     PathRef(Task.dest)
   }
   def docSources = Task { Seq(forjExportedSources()) }
+  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on
+  def javadocOptions = super.javadocOptions() ++ Seq("--enable-preview", "--source", "28")
 }
 
 object app extends ForjModule
@@ -87,9 +89,21 @@ import static app.Show.*;
 
 import java.util.Optional;
 
+/** Shows values twice: see {@link #twice(Object)}. */
 public class Main {
-    static <A> String twice(A a)(using Show<A> s) {
+    /** Shows {@code a} twice, with the {@link Show} in scope. */
+    public static <A> String twice(A a)(using Show<A> s) {
         return a.show() + a.show();
+    }
+
+    /** Lifts one into any {@code F}; {@link #io()} is the same in {@code IO}. */
+    public static <F<_>> F<Integer> one()(using forj.typeclass.Applicative<F> ap) {
+        return ap.pure(1);
+    }
+
+    /** forj.effect.IO is a preview class file, which javadoc only reads with --enable-preview. */
+    public static forj.effect.IO<Integer> io() {
+        return forj.effect.IO.pure(1);
     }
 
     public static void main(String[] args) {
