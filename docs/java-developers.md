@@ -1,6 +1,8 @@
 # forj for Java developers
 
-This guide assumes you know Java (lambdas, `Optional`, streams) but not Scala.
+This guide assumes you know Java (lambdas, `Optional`, streams) but not Scala. It starts
+from the nested `flatMap` chains forj replaces, then covers `F<_>` and `IO`, type classes with
+`given`/`using`, `derives`, extension methods and string interpolation.
 
 ## The problem it solves
 

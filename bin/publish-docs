@@ -4,7 +4,8 @@
 # - README.md is the front page, and PAGES come along (GitHub Pages renders the markdown with
 #   Jekyll; links between .md files keep working);
 # - each module's javadoc sits under its path (MODULES);
-# - every README page has a tab bar linking to them.
+# - every README page has a tab bar linking to them, and every page loads the site's shared nav
+#   bar (/nav.js), which links critium and all the projects.
 #
 #   bin/publish-docs            builds the site into a temp dir and prints where; pushes nothing
 #   bin/publish-docs --push     ...and force-pushes it to origin's gh-pages branch
@@ -25,6 +26,8 @@ MODULES=("core:api" "examples:examples")
 PAGES=("README.md" "docs")
 # root-relative: /<repo>/ is on the site's domain, so this is critium.github.io/javadoc.css
 STYLE_URL="/javadoc.css"
+# the site's shared nav bar: draws the links to critium and every project, on hosted pages only
+NAV_SCRIPT='<script src="/nav.js" defer></script>'
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$ROOT"
@@ -48,23 +51,35 @@ for m in "${MODULES[@]}"; do
   mkdir -p "$WORK/$path"
   cp -R "$docs/." "$WORK/$path/"
   printf '@import url("%s");\n' "$STYLE_URL" > "$WORK/$path/resource-files/javadoc.css"
+  # the site's shared nav bar (critium and every project), on every hosted javadoc page
+  find "$WORK/$path" -name '*.html' -exec perl -pi -e "s{</head>}{$NAV_SCRIPT\n</head>}" {} +
 done
 for page in "${PAGES[@]}"; do
   if [ -e "$page" ]; then cp -R "$page" "$WORK/"; fi
 done
-# a folder of guides gets an index listing them by title, so /<repo>/<folder>/ is a page too
+# a folder of guides gets an index, so /<repo>/<folder>/ is a page too: each guide by title,
+# with its first paragraph as the summary, and links to the API docs
+api_links=""
+for m in "${MODULES[@]}"; do
+  path="${m#*:}"
+  api_links+="${api_links:+, }[$path](../$path/)"
+done
 for page in "${PAGES[@]}"; do
   dir="$WORK/$page"
   if [ -d "$dir" ] && [ ! -e "$dir/index.md" ] && [ ! -e "$dir/README.md" ]; then
     {
       # front matter, so Jekyll renders it for sure (index.md without it was skipped)
       printf -- '---\ntitle: %s\n---\n\n' "$page"
-      echo "# $page"
+      echo "# $repo guides"
+      echo
+      echo "Guides for $repo, each for a different reader. API reference: $api_links."
       echo
       for md in "$dir"/*.md; do
         [ -e "$md" ] && [ "$(basename "$md")" != index.md ] || continue
         title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
-        echo "- [${title:-$(basename "$md" .md)}]($(basename "$md"))"
+        # the first paragraph after the title, joined into one line
+        summary="$(awk '/^# / && !t { t = 1; next } t && /^#/ { exit } t && NF { p = p (p ? " " : "") $0; next } t && p { exit } END { print p }' "$md")"
+        echo "- **[${title:-$(basename "$md" .md)}]($(basename "$md"))**${summary:+: $summary}"
       done
     } > "$dir/index.md"
   fi
@@ -87,6 +102,7 @@ cat > "$WORK/_layouts/default.html" <<HTML
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% if page.title and page.title != site.title %}{{ page.title }} · {% endif %}$repo</title>
 <link rel="stylesheet" href="/readme.css">
+$NAV_SCRIPT
 </head>
 <body>
 <nav class="tabline">$tabs <span class="fill"></span><a class="right" href="https://critium.github.io/">critium</a> <a class="right" href="https://github.com/critium/$repo">github</a></nav>
