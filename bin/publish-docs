@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Publishes this repo's GitHub Pages site, https://critium.github.io/<repo>/, by force-pushing
+# a fresh gh-pages branch (generated docs keep no history):
+# - README.md is the front page, and PAGES come along (GitHub Pages renders the markdown with
+#   Jekyll; links between .md files keep working);
+# - each module's javadoc sits under its path (MODULES);
+# - every README page has a tab bar linking to them.
+#
+#   bin/publish-docs            builds the site into a temp dir and prints where; pushes nothing
+#   bin/publish-docs --push     ...and force-pushes it to origin's gh-pages branch
+#
+# The look comes from critium.github.io:
+# - the javadoc's stylesheet becomes an @import of the site's javadoc.css;
+# - the README pages use the site's readme.css;
+# so a style change there restyles every repo's hosted docs. Javadoc jars keep the copy baked in
+# at build time. FORJ_DOCS_STYLE=<checkout of critium.github.io> builds against a local copy of
+# the style; the hosted pages still load the live one.
+#
+# Other critium repos copy this script and change MODULES and PAGES.
+set -euo pipefail
+
+# Mill module -> path of its javadoc on the site
+MODULES=("core:api" "examples:examples")
+# Markdown published next to the javadoc; README.md becomes the front page
+PAGES=("README.md" "docs")
+# root-relative: /<repo>/ is on the site's domain, so this is critium.github.io/javadoc.css
+STYLE_URL="/javadoc.css"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+cd "$ROOT"
+push=false
+[ "${1:-}" = "--push" ] && push=true
+repo="$(basename -s .git "$(git remote get-url origin)")"
+
+# Mill reads words after a task as that task's arguments: separate the tasks with "+"
+tasks=()
+for m in "${MODULES[@]}"; do tasks+=(${tasks[@]:+"+"} "${m%%:*}.javadocGenerated"); done
+./mill "${tasks[@]}"
+
+WORK="$(mktemp -d)"
+for m in "${MODULES[@]}"; do
+  module="${m%%:*}"; path="${m#*:}"
+  docs="out/$module/javadocGenerated.dest/javadoc"
+  if [ ! -f "$docs/resource-files/javadoc.css" ]; then
+    echo "publish-docs: $module's docs have no stylesheet (critium.github.io unreachable?); not publishing them unstyled" >&2
+    exit 1
+  fi
+  mkdir -p "$WORK/$path"
+  cp -R "$docs/." "$WORK/$path/"
+  printf '@import url("%s");\n' "$STYLE_URL" > "$WORK/$path/resource-files/javadoc.css"
+done
+for page in "${PAGES[@]}"; do
+  if [ -e "$page" ]; then cp -R "$page" "$WORK/"; fi
+done
+
+# Jekyll lays out the markdown with this; javadoc's HTML has no front matter, so it is served
+# as it is
+tabs='<a href="{{ site.baseurl }}/"{% if page.url == "/" %} class="active"{% endif %}>README.md</a>'
+for m in "${MODULES[@]}"; do
+  path="${m#*:}"
+  tabs+=" <a href=\"{{ site.baseurl }}/$path/\">$path</a>"
+done
+mkdir -p "$WORK/_layouts"
+printf '%s\n' "title: $repo" "defaults:" "  - scope: { path: \"\" }" "    values: { layout: default }" > "$WORK/_config.yml"
+cat > "$WORK/_layouts/default.html" <<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% if page.title and page.title != site.title %}{{ page.title }} · {% endif %}$repo</title>
+<link rel="stylesheet" href="/readme.css">
+</head>
+<body>
+<nav class="tabline">$tabs <span class="fill"></span><a class="right" href="https://critium.github.io/">critium</a> <a class="right" href="https://github.com/critium/$repo">github</a></nav>
+<main>
+{{ content }}
+</main>
+</body>
+</html>
+HTML
+
+commit="$(git rev-parse --short HEAD)"
+dirty="$(git status --porcelain | head -1)"
+git -C "$WORK" init -q -b gh-pages
+git -C "$WORK" add -A
+git -C "$WORK" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" \
+  commit -q -m "Pages for ${commit}${dirty:+ (uncommitted changes)}"
+
+if ! $push; then
+  echo "publish-docs: built $WORK; run with --push to publish to https://critium.github.io/$repo/"
+  exit 0
+fi
+git -C "$WORK" push -q -f "$(git remote get-url origin)" gh-pages
+rm -rf "$WORK"
+echo "publish-docs: pushed gh-pages; live at https://critium.github.io/$repo/ in a minute or two"
+echo "  (Pages must deploy from the gh-pages branch, / (root): the repo's Settings > Pages)"

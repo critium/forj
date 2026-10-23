@@ -58,6 +58,8 @@ raw"C:\temp\$file"                         // backslashes stay backslashes
 
 - New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
 - Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
+- API reference: [javadoc for forj-core](https://critium.github.io/forj/api/), and the
+  [examples](https://critium.github.io/forj/examples/).
 
 ## Higher-kinded types, the CE2 ladder and tagless final
 
@@ -207,16 +209,80 @@ trait ForjModule extends JavaModule {
     PathRef(Task.dest)
   }
   def docSources = Task { Seq(forjExportedSources()) }
-  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on
-  def javadocOptions = super.javadocOptions() ++ Seq("--enable-preview", "--source", "28")
+  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on;
+  // the look is critium.github.io's (docStyle below)
+  def javadocOptions = Task {
+    super.javadocOptions() ++ Seq("--enable-preview", "--source", "28") ++
+      docStyle.stylesheet().toSeq.flatMap(css => Seq("--add-stylesheet", css.path.toString))
+  }
+}
+
+/**
+ * The docs' look lives on critium.github.io (javadoc.css and the palette.css it imports), shared
+ * by every critium repo's docs. Builds take a copy, palette inlined, because a javadoc jar is
+ * read offline; docs hosted on Pages load it live instead (bin/publish-docs).
+ *
+ * FORJ_DOCS_STYLE=<checkout of critium.github.io> uses a local copy, to try a change before
+ * publishing it. Unreachable (offline): javadoc's own look, with a warning.
+ */
+object docStyle extends Module {
+  def site = "https://critium.github.io"
+
+  def css: T[Option[String]] = Task.Input {
+    def read(name: String): Option[String] = Task.env.get("FORJ_DOCS_STYLE") match {
+      case Some(dir) => Some(os.Path(dir, BuildCtx.workspaceRoot) / name).filter(os.exists(_)).map(os.read(_))
+      case None =>
+        try {
+          val r = requests.get(s"$site/$name", connectTimeout = 3000, readTimeout = 5000, check = false)
+          if (r.statusCode == 200) Some(r.text()) else None
+        } catch { case _: Exception => None }
+    }
+    val found = for (javadoc <- read("javadoc.css"); palette <- read("palette.css"))
+      yield {
+        // palette.css inlined; browsers ignore an @import after a rule, so imports go first
+        val lines = javadoc.replace("@import url(\"palette.css\");", palette).linesIterator.toSeq
+        val (imports, rules) = lines.partition(_.trim.startsWith("@import"))
+        (imports ++ rules).mkString("", "\n", "\n")
+      }
+    if (found.isEmpty) Task.log.warn(s"forj: no docs stylesheet from ${Task.env.getOrElse("FORJ_DOCS_STYLE", site)}; javadoc's default look")
+    found
+  }
+
+  /** Written under its content hash: Mill reruns javadoc when its options change, not a file's. */
+  def stylesheet: T[Option[PathRef]] = Task {
+    css().map { text =>
+      val file = Task.dest / Integer.toHexString(text.hashCode) / "javadoc.css"
+      os.write(file, text, createFolders = true)
+      PathRef(file)
+    }
+  }
 }
 ```
 
-The plugin jar carries its `META-INF/services` entry, so nothing else is needed. The javadoc
+The recipe needs `import mill.api.BuildCtx` at the top of `build.mill`, for `docStyle`. The plugin jar carries its `META-INF/services` entry, so nothing else is needed. The javadoc
 jar documents each declaration as plain Java callers see it: `F<A>` appears as
 `forj.Kind<F, A>`, and a `using` instance as an ordinary parameter. Consumers must
 compile and run on the same JDK build with `--enable-preview`: the jars hold preview class
 files.
+
+### API docs
+
+`bin/publish-docs` builds the Pages site and prints where; `bin/publish-docs --push`
+force-pushes it to the `gh-pages` branch, served at https://critium.github.io/forj/:
+- this README is the front page, with `docs/` next to it;
+- the javadoc of `core` is at `api/`, and of `examples` at `examples/`;
+- a tab bar on every README page links them.
+
+Other critium repos copy the script and change its `MODULES` and `PAGES` lines.
+
+The look lives on [critium.github.io](https://github.com/critium/critium.github.io), in
+`javadoc.css` and the `palette.css` it shares with the site:
+- **Hosted docs** load it live (`javadoc.css`, and `readme.css` for the README pages), so a
+  change there restyles every repo's docs.
+- **Javadoc jars** get a copy at build time (`docStyle` in `build.mill`), because jars are read
+  offline. If the site can't be reached, they use javadoc's default look, with a warning.
+- **To try a style change** before publishing it, set `FORJ_DOCS_STYLE` to a checkout of the
+  site, for example `FORJ_DOCS_STYLE=../critium.github.io bin/publish-docs`.
 
 ## Project layout
 

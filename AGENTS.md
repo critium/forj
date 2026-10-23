@@ -137,6 +137,8 @@ only where a file must stay parseable by plain tools.
 - javadoc runs on sources rewritten by `forj.plugin.ExportSources`
   (`forjExportedSources` in `ForjModule`), because the `javadoc` tool can't load the plugin.
   Pages therefore show `forj.Kind<F, A>` and `using` instances as ordinary parameters.
+- The docs' look comes from critium.github.io's `javadoc.css`; `bin/publish-docs [--push]`
+  publishes them to https://critium.github.io/forj/. See the README's "API docs" section.
 
 ## Part 2: working on the plugin
 

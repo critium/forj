@@ -140,6 +140,18 @@ forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on
     including `Other#m(...)` links from other files (`ExportSourcesTest`). Links that already
     list every parameter, or match no such method or more than one, stay as written.
 
+### API docs on GitHub Pages (2026-10-23)
+
+**Status:** ready, not yet pushed.
+- `bin/publish-docs --push` publishes `core` and `examples` docs to https://critium.github.io/forj/.
+- The style lives in critium.github.io: `javadoc.css`, plus a new `palette.css` shared with
+  the site's `styles.css`.
+- To go live:
+  1. push the site repo;
+  2. run `bin/publish-docs --push`;
+  3. enable Pages from `gh-pages` (once).
+- forj-codec and forj-http copy the script (`MODULES`) and the README recipe's `docStyle`.
+
 ## Enforce a coding style (2-space indentation)
 
 **Status:** open, added 2026-10-06. The preferred style is 2 spaces; the code is 4 spaces

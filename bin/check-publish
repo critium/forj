@@ -17,6 +17,7 @@ cat > "$WORK/build.mill" <<EOF
 package build
 
 import mill.*
+import mill.api.BuildCtx
 import mill.javalib.*
 
 /** javac internals the forj plugin uses: the compiler JVM needs them exported and opened. */
@@ -55,8 +56,53 @@ trait ForjModule extends JavaModule {
     PathRef(Task.dest)
   }
   def docSources = Task { Seq(forjExportedSources()) }
-  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on
-  def javadocOptions = super.javadocOptions() ++ Seq("--enable-preview", "--source", "28")
+  // forj-core holds preview class files (IO, For, ...), which javadoc reads only with preview on;
+  // the look is critium.github.io's (docStyle below)
+  def javadocOptions = Task {
+    super.javadocOptions() ++ Seq("--enable-preview", "--source", "28") ++
+      docStyle.stylesheet().toSeq.flatMap(css => Seq("--add-stylesheet", css.path.toString))
+  }
+}
+
+/**
+ * The docs' look lives on critium.github.io (javadoc.css and the palette.css it imports), shared
+ * by every critium repo's docs. Builds take a copy, palette inlined, because a javadoc jar is
+ * read offline; docs hosted on Pages load it live instead (bin/publish-docs).
+ *
+ * FORJ_DOCS_STYLE=<checkout of critium.github.io> uses a local copy, to try a change before
+ * publishing it. Unreachable (offline): javadoc's own look, with a warning.
+ */
+object docStyle extends Module {
+  def site = "https://critium.github.io"
+
+  def css: T[Option[String]] = Task.Input {
+    def read(name: String): Option[String] = Task.env.get("FORJ_DOCS_STYLE") match {
+      case Some(dir) => Some(os.Path(dir, BuildCtx.workspaceRoot) / name).filter(os.exists(_)).map(os.read(_))
+      case None =>
+        try {
+          val r = requests.get(s"\$site/\$name", connectTimeout = 3000, readTimeout = 5000, check = false)
+          if (r.statusCode == 200) Some(r.text()) else None
+        } catch { case _: Exception => None }
+    }
+    val found = for (javadoc <- read("javadoc.css"); palette <- read("palette.css"))
+      yield {
+        // palette.css inlined; browsers ignore an @import after a rule, so imports go first
+        val lines = javadoc.replace("@import url(\"palette.css\");", palette).linesIterator.toSeq
+        val (imports, rules) = lines.partition(_.trim.startsWith("@import"))
+        (imports ++ rules).mkString("", "\n", "\n")
+      }
+    if (found.isEmpty) Task.log.warn(s"forj: no docs stylesheet from \${Task.env.getOrElse("FORJ_DOCS_STYLE", site)}; javadoc's default look")
+    found
+  }
+
+  /** Written under its content hash: Mill reruns javadoc when its options change, not a file's. */
+  def stylesheet: T[Option[PathRef]] = Task {
+    css().map { text =>
+      val file = Task.dest / Integer.toHexString(text.hashCode) / "javadoc.css"
+      os.write(file, text, createFolders = true)
+      PathRef(file)
+    }
+  }
 }
 
 object app extends ForjModule
@@ -168,4 +214,11 @@ if ! grep -qF "app/Main.html" <<<"$listing"; then
   echo "check-publish: the javadoc jar has no page for app.Main" >&2
   exit 1
 fi
-echo "check-publish: ok ($expected; also compiles next to an annotation processor; javadoc builds)"
+styled="javadoc in its default look (critium.github.io unreachable)"
+if grep -qF "resource-files/javadoc.css" <<<"$listing"; then
+  styled="javadoc in critium.github.io's style"
+elif [ -n "${FORJ_DOCS_STYLE:-}" ]; then
+  echo "check-publish: FORJ_DOCS_STYLE is set, but the javadoc jar has no stylesheet" >&2
+  exit 1
+fi
+echo "check-publish: ok ($expected; also compiles next to an annotation processor; $styled)"

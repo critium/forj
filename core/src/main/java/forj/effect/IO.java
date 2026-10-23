@@ -30,7 +30,7 @@ import java.util.function.Function;
  * {@link InterruptedException}, so {@code bracket} releases still run.
  *
  * <p>{@code IO} is its own witness: {@code IO<A>} is a {@code Kind<IO, A>}, and its instance,
- * {@link #concurrent}, provides the whole ladder up to {@link Concurrent}.
+ * {@link #concurrent}, provides the whole ladder up to {@link ConcurrentEffect}.
  */
 @SuppressWarnings("rawtypes")
 public abstract sealed class IO<A> implements Kind<IO, A> {
