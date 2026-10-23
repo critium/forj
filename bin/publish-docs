@@ -74,13 +74,29 @@ for page in "${PAGES[@]}"; do
       echo
       echo "Guides for $repo, each for a different reader. API reference: $api_links."
       echo
+      # front matter in a guide can set `order: N` (default 50, then by file name) and
+      # `secondary: true` (for maintainers or agents: listed last, in small type); a guide named
+      # *-for-agents.md is secondary without it
+      main=(); extra=()
       for md in "$dir"/*.md; do
         [ -e "$md" ] && [ "$(basename "$md")" != index.md ] || continue
+        meta="$(awk 'NR == 1 && $0 != "---" { exit } NR > 1 && $0 == "---" { exit } NR > 1 { print }' "$md")"
+        order="$(sed -n 's/^order: *//p' <<<"$meta")"
         title="$(grep -m1 '^# ' "$md" | sed 's/^# //')"
         # the first paragraph after the title, joined into one line
         summary="$(awk '/^# / && !t { t = 1; next } t && /^#/ { exit } t && NF { p = p (p ? " " : "") $0; next } t && p { exit } END { print p }' "$md")"
-        echo "- **[${title:-$(basename "$md" .md)}]($(basename "$md"))**${summary:+: $summary}"
+        line="$(printf '%03d %s\t[%s](%s)%s' "${order:-50}" "$(basename "$md")" "${title:-$(basename "$md" .md)}" "$(basename "$md")" "${summary:+: $summary}")"
+        if grep -qx 'secondary: *true' <<<"$meta" || [[ "$md" == *-for-agents.md ]]; then extra+=("$line"); else main+=("$line"); fi
       done
+      if [ ${#main[@]} -gt 0 ]; then
+        printf '%s\n' "${main[@]}" | sort | cut -f2- | sed 's/^\[\([^]]*\)\](\([^)]*\))/- **[\1](\2)**/'
+      fi
+      if [ ${#extra[@]} -gt 0 ]; then
+        echo
+        echo "<sub>Notes for maintainers and agents:</sub>"
+        echo
+        printf '%s\n' "${extra[@]}" | sort | cut -f2- | sed 's/^/- <sub>/; s/$/<\/sub>/'
+      fi
     } > "$dir/index.md"
   fi
 done
