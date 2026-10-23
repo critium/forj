@@ -106,7 +106,7 @@ Follow-ups:
 
 ### Found in forj-http step 3 (2026-10-22)
 
-**Status:** the two resolver bugs are fixed (`ForjHttpLimitsTest`), javadoc is open.
+**Status:** all fixed (2026-10-22): the resolver bugs in `ForjHttpLimitsTest`, javadoc in `bin/check-publish`.
 forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on the class.
 
 - **Fixed: an overload whose `using` count equals the call's argument count took the
@@ -118,14 +118,16 @@ forj-http can drop the renames (`errorsWith`, `accessLogTo`) and call `start` on
 - **Fixed: calling an overridden `using` method on the implementing class was "ambiguous".**
   The method search found both `Impl.start` and the `Starter.start` it overrides. Now
   overridden methods are dropped, as javac does (`MethodSymbol.overrides`).
-- **Publishing: javadoc can't read forj sources.** Mill's `publishM2Local` builds a javadoc
-  jar, and the `javadoc` tool parses sources without the plugin, so `<F<_>>`, `(using ...)`
-  and the rest are syntax errors. A real fix would let javadoc see the desugared sources,
-  for example a plugin option that writes `SourceRewriter`'s output to a directory to run
-  javadoc on (positions don't matter there).
-  - Workaround: forj-http's `ForjModule` publishes a placeholder javadoc jar pointing at the
-    sources jar (`server/build.mill`, `docJar`). Belongs in the shared Mill plugin when there
-    is one.
+- **Fixed: javadoc couldn't read forj sources.** The `javadoc` tool parses sources without
+  the plugin. Now `forj.plugin.ExportSources` writes them as the text stage rewrites them, and
+  `ForjModule` (and the downstream recipe in the README) points `docSources` there.
+  `bin/check-publish` builds a downstream javadoc jar.
+  - Docs show declarations as plain Java callers see them: `forj.Kind<F, A>` for `F<A>`, and
+    `using` instances as ordinary parameters. Showing forj syntax would take a custom doclet.
+  - A varargs parameter followed by a `using` clause is documented as an array (that move
+    happens after parsing).
+  - forj-http can replace its placeholder javadoc jar with the recipe's
+    `forjExportedSources`/`docSources`.
 
 ## Enforce a coding style (2-space indentation)
 

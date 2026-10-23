@@ -195,10 +195,24 @@ trait ForjModule extends JavaModule {
     if (processors.isEmpty) processors
     else processors ++ compileClasspath().filter(_.path.last.startsWith("forj-plugin-"))
   }
+  // javadoc parses sources without the plugin, so it reads them as the plugin's text stage
+  // rewrites them (F<A> as forj.Kind<F, A>, using clauses as @forj.Using parameters)
+  def forjExportedSources = Task {
+    val plugin = compileClasspath().filter(_.path.last.startsWith("forj-plugin-")).map(_.path)
+    os.proc(
+      javaHome().get.path / "bin" / "java", forjCompilerJvmOptions,
+      "-cp", plugin.mkString(java.io.File.pathSeparator),
+      "forj.plugin.ExportSources", Task.dest, allSources().map(_.path)
+    ).call(stdout = os.Inherit)
+    PathRef(Task.dest)
+  }
+  def docSources = Task { Seq(forjExportedSources()) }
 }
 ```
 
-The plugin jar carries its `META-INF/services` entry, so nothing else is needed. Consumers must
+The plugin jar carries its `META-INF/services` entry, so nothing else is needed. The javadoc
+jar documents each declaration as plain Java callers see it: `F<A>` appears as
+`forj.Kind<F, A>`, and a `using` instance as an ordinary parameter. Consumers must
 compile and run on the same JDK build with `--enable-preview`: the jars hold preview class
 files.
 

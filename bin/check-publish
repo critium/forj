@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks the published artifacts the way a downstream build uses them: a throw-away Mill
 # project that depends on forj-core and puts forj-plugin on the compile classpath, both from
-# ~/.m2, compiles a program using forj syntax with -Xplugin:Forj, and runs it.
+# ~/.m2, compiles a program using forj syntax with -Xplugin:Forj, runs it, and builds its
+# javadoc jar.
 #
 # Run ./mill __.publishM2Local first. The build below is the downstream recipe libraries copy.
 set -euo pipefail
@@ -42,6 +43,18 @@ trait ForjModule extends JavaModule {
     if (processors.isEmpty) processors
     else processors ++ compileClasspath().filter(_.path.last.startsWith("forj-plugin-"))
   }
+  // javadoc parses sources without the plugin, so it reads them as the plugin's text stage
+  // rewrites them (F<A> as forj.Kind<F, A>, using clauses as @forj.Using parameters)
+  def forjExportedSources = Task {
+    val plugin = compileClasspath().filter(_.path.last.startsWith("forj-plugin-")).map(_.path)
+    os.proc(
+      javaHome().get.path / "bin" / "java", forjCompilerJvmOptions,
+      "-cp", plugin.mkString(java.io.File.pathSeparator),
+      "forj.plugin.ExportSources", Task.dest, allSources().map(_.path)
+    ).call(stdout = os.Inherit)
+    PathRef(Task.dest)
+  }
+  def docSources = Task { Seq(forjExportedSources()) }
 }
 
 object app extends ForjModule
@@ -131,4 +144,14 @@ if [ ! -f out/withProcessor/compile.dest/classes/META-INF/BenchmarkList ]; then
   echo "check-publish: JMH's annotation processor didn't run" >&2
   exit 1
 fi
-echo "check-publish: ok ($expected; also compiles next to an annotation processor)"
+if ! output="$(./mill --no-server app.docJar 2>&1)"; then
+  echo "$output"
+  echo "check-publish: javadoc of forj sources failed" >&2
+  exit 1
+fi
+listing="$(unzip -l out/app/docJar.dest/out.jar)"   # not piped into grep -q: SIGPIPE under pipefail
+if ! grep -qF "app/Main.html" <<<"$listing"; then
+  echo "check-publish: the javadoc jar has no page for app.Main" >&2
+  exit 1
+fi
+echo "check-publish: ok ($expected; also compiles next to an annotation processor; javadoc builds)"

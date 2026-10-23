@@ -112,6 +112,19 @@ trait ForjModule extends ForjJava {
     val processors = super.annotationProcessorsResolvedMvnDeps()
     if (processors.isEmpty) processors else processors ++ Seq(plugin.compile().classes) ++ plugin.resources()
   }
+
+  // javadoc parses sources without the plugin, so forj syntax would be syntax errors: it reads
+  // them as the plugin's text stage rewrites them (F<A> as forj.Kind<F, A>, using clauses as
+  // @forj.Using parameters), which is also what plain Java callers see
+  def forjExportedSources = Task {
+    os.proc(
+      javaHome().get.path / "bin" / "java", pluginJvmOptions,
+      "-cp", plugin.compile().classes.path,
+      "forj.plugin.ExportSources", Task.dest, allSources().map(_.path)
+    ).call(stdout = os.Inherit)
+    PathRef(Task.dest)
+  }
+  def docSources = Task { Seq(forjExportedSources()) }
 }
 
 object examples extends ForjModule {

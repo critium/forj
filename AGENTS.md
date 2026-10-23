@@ -134,6 +134,9 @@ only where a file must stay parseable by plain tools.
 - `./mill __.publishM2Local` publishes to `~/.m2`, as `forj:forj-core` and
   `forj:forj-plugin` (`0.1.0-SNAPSHOT`). `bin/check-publish` then checks that a downstream
   build works against it. Downstream repos consume forj only this way.
+- javadoc runs on sources rewritten by `forj.plugin.ExportSources`
+  (`forjExportedSources` in `ForjModule`), because the `javadoc` tool can't load the plugin.
+  Pages therefore show `forj.Kind<F, A>` and `using` instances as ordinary parameters.
 
 ## Part 2: working on the plugin
 
