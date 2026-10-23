@@ -36,7 +36,8 @@ mapping) and `TODO.md` (known limits, follow-ups and design decisions).
 | `import static forj.Language.lifting;` | opt-in automatic lifting for this file | nothing; it changes how calls in the file resolve |
 
 The keywords are contextual: `forj`, `given`, `using`, `extension` and `derives` remain
-usable as ordinary names elsewhere. Each keyword form has a plain-Java spelling (`@Given`,
+usable as ordinary names elsewhere. Annotations and access modifiers go before `given` and
+`extension` (`@Deprecated private given ...`); other modifiers (`static`, `final`) are implied. Each keyword form has a plain-Java spelling (`@Given`,
 `@Using`, `@Extension`, `@Derives(X.class)`) with identical behaviour. Write that spelling
 only where a file must stay parseable by plain tools.
 

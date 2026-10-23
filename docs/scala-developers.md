@@ -241,6 +241,7 @@ Differences from Scala 3:
 - No implicit conversions, no `using` on constructors.
 - Extensions are declared one method at a time, as a modifier (`extension <A> String show(A a)(using Show<A> s)`)
   with the receiver as the first parameter, rather than in an `extension (a: A)` block.
+  Annotations and access modifiers go before the keyword, as with `given`.
   Lookup follows Scala's: the enclosing scope, imports, the type classes of givens in scope,
   the receiver type's classes, then `forj.Syntax`. A method the type has always wins.
 - Explicit type arguments on an extension call (`fa.<B>map(f)`) aren't supported.

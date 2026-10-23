@@ -358,7 +358,8 @@ Show.show(List.of(1, 2));   // "[1, 2]"
 ```
 
 - **`given`** declares an instance. In a class it becomes a `public static` member (write
-  `private` or another modifier to change that).
+  `private` or another modifier to change that). Annotations and access modifiers go before
+  the keyword: `@Deprecated private given Show<Integer> old = ...;`.
 - **`using`** declares parameters that callers leave out, in their own parentheses after
   the ordinary ones, as in Scala 3: `f(A a)(using Show<A> s)`, or several:
   `f(A a)(using Show<A> s, Ord<A> o)`. A caller can still pass them, which skips resolution:
@@ -554,7 +555,9 @@ static <F<_>, A> F<A> retry(F<A> attempt, int times)(using MonadError<F, Throwab
 
 Asking for a capability the effect doesn't have is still a compile error:
 `callable.filter(p)` gives `forj: no given forj.typeclass.FunctorFilter<java.util.concurrent.Callable>`.
-The plain-Java spelling is `@Extension public static`.
+Annotations and access modifiers go before the keyword, as on any method:
+`@Deprecated(forRemoval = true) extension <A> String shout(A a)(using Show<A> s)`. The
+plain-Java spelling is `@Extension public static`.
 
 ## Automatic lifting (opt-in)
 
