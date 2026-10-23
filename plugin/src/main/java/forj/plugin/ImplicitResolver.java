@@ -25,7 +25,6 @@ import com.sun.tools.javac.comp.AttrContext;
 import com.sun.tools.javac.comp.Env;
 import com.sun.tools.javac.comp.Resolve;
 import com.sun.tools.javac.tree.JCTree;
-import com.sun.tools.javac.tree.JCTree.JCClassDecl;
 import com.sun.tools.javac.tree.JCTree.JCCompilationUnit;
 import com.sun.tools.javac.tree.JCTree.JCExpression;
 import com.sun.tools.javac.tree.JCTree.JCFieldAccess;
@@ -81,40 +80,45 @@ import javax.tools.Diagnostic;
  *   <li>{@code forj.Instances}: instances for JDK types.</li>
  * </ol>
  * The inserted arguments are ordinary Java, so javac type checks them like any other code.
+ *
+ * <p>Each pass visits every call ({@link #pass}) in a fixed order: unshadowing generated names,
+ * the comprehension plumbing and narrowing ({@link Lifting}), extension calls
+ * ({@link Extensions}), then {@code using} arguments ({@link CallSite#complete}). Before the
+ * passes, {@link DerivationSpecializer} rewrites derived givens.
  */
 final class ImplicitResolver {
 
     private static final int MAX_DEPTH = 16;
     private static final boolean TRACE = Boolean.getBoolean("forj.trace");
 
-    private static void trace(String message) {
+    static void trace(String message) {
         if (TRACE) {
             System.err.println("[forj.trace] " + message);
         }
     }
 
     private final Trees trees;
-    private final Attr attr;
+    final Attr attr;
     private final ArgumentAttr argumentAttr;
     private final java.lang.reflect.Field argumentCache;
-    private final Types types;
-    private final Resolve rs;
-    private final Log log;
-    private final TreeMaker make;
-    private final Names names;
+    final Types types;
+    final Resolve rs;
+    final Log log;
+    final TreeMaker make;
+    final Names names;
     private final ClassSymbol givenAnnotation;
     private final ClassSymbol usingAnnotation;
     private final javax.lang.model.util.Elements elements;
-    private final ClassSymbol lowerAnnotation;
-    private final ClassSymbol kindSymbol;
-    private final ClassSymbol forClass;
+    final ClassSymbol lowerAnnotation;
+    final ClassSymbol kindSymbol;
+    final ClassSymbol forClass;
     private final ClassSymbol defaultInstances;
     private final ClassSymbol extensionAnnotation;
-    private final ClassSymbol defaultSyntax;
+    final ClassSymbol defaultSyntax;
     private final Name forjLower;
-    private final Name forjLift;
+    final Name forjLift;
 
-    private enum Outcome { SKIPPED, RESOLVED, PENDING }
+    enum Outcome { SKIPPED, RESOLVED, PENDING }
 
     /** Names of methods known to take {@code using} parameters; calls to anything else are skipped quickly. */
     private final Set<Name> usingMethodNames = new java.util.HashSet<>();
@@ -125,8 +129,8 @@ final class ImplicitResolver {
     private final Set<Name> indexedPackages = new java.util.HashSet<>();
 
     // opt-in features (forj.Language), switched on per file by `import static forj.Language.x;`
-    private static final String LIFT_RESULTS = "liftResults";
-    private static final String LIFT_RECEIVERS = "liftReceivers";
+    static final String LIFT_RESULTS = "liftResults";
+    static final String LIFT_RECEIVERS = "liftReceivers";
     private static final String LIFT_ARGUMENTS = "liftArguments";
     private final Map<JCCompilationUnit, Set<String>> features = new HashMap<>();
     private final Map<JCCompilationUnit, Set<Name>> variableNames = new HashMap<>();
@@ -165,9 +169,9 @@ final class ImplicitResolver {
         });
     }
 
-    /** Givens the deriver added, not yet looked at: see {@link #specializeDerivations}. */
-    private final List<Deriver.Derivation> derivations;
-    private final com.sun.tools.javac.comp.Enter enter;
+    /** Givens the deriver added, not yet looked at: see {@link DerivationSpecializer}. */
+    final List<Deriver.Derivation> derivations;
+    final com.sun.tools.javac.comp.Enter enter;
 
     /** The {@code forj} identifiers the desugarer generated ({@code forj.For.forjFlatMap}); see {@code unshadow}. */
     private final Set<JCTree.JCIdent> generatedQualifiers;
@@ -241,7 +245,7 @@ final class ImplicitResolver {
             return;
         }
         indexImports(unit);
-        specializeDerivations();
+        new DerivationSpecializer(this).run();
         // A call can only be resolved once its arguments' types are known, and inside a lambda
         // those can depend on resolving the enclosing call first (nested comprehensions), and
         // resolving a step lets the next pass write out its type arguments. So: passes until
@@ -257,95 +261,6 @@ final class ImplicitResolver {
         }
         if (TRACE) {
             trace("resolved class:\n" + classPath.getLeaf());
-        }
-    }
-
-    /**
-     * derives, specialized: for each derived given whose record javac has entered, if the type
-     * class declares {@code deriveProduct} and {@code deriveField}, replace
-     * {@code X.<R>product(ctor, fields...)} with
-     * {@code X.<R>deriveProduct(ctor, (Out out, R value) -> { X.deriveField(out, 0, value.c0()); ... }, fields...)}.
-     * {@code Out} comes from {@code deriveProduct}'s encoder parameter, so forj never names a
-     * type of the library; javac's overload resolution picks each component's {@code deriveField}.
-     */
-    private void specializeDerivations() {
-        for (var it = derivations.iterator(); it.hasNext(); ) {
-            Deriver.Derivation d = it.next();
-            if (d.record().sym == null) {
-                continue;   // not entered yet: its own class comes later
-            }
-            it.remove();
-            try {
-                specialize(d);
-            } catch (RuntimeException e) {
-                trace("derives: not specializing " + d.record().name + ": " + e);
-            }
-        }
-    }
-
-    private void specialize(Deriver.Derivation d) {
-        var recordSym = (ClassSymbol) d.record().sym;
-        Env<AttrContext> env = enter.getEnv(recordSym);
-        if (env == null || !(d.field().init instanceof JCMethodInvocation product)) {
-            return;
-        }
-        Type typeClass = attribTypeQuietly(d.typeClass(), env);
-        if (typeClass == null || !(typeClass.tsym instanceof ClassSymbol x)) {
-            return;
-        }
-        indexMembers(x);
-        MethodSymbol deriveProduct = null;
-        boolean hasDeriveField = false;
-        for (Symbol s : x.members().getSymbols()) {
-            if (s instanceof MethodSymbol m && (m.flags() & Flags.STATIC) != 0) {
-                if (m.name.contentEquals("deriveProduct") && m.params().size() >= 2) {
-                    deriveProduct = m;
-                }
-                hasDeriveField |= m.name.contentEquals("deriveField");
-            }
-        }
-        if (deriveProduct == null || !hasDeriveField || deriveProduct.type.getTypeArguments().size() != 1) {
-            return;
-        }
-        // the encoder parameter's functional type, with deriveProduct's T as the record: (Out, R) -> ...
-        Type encoderType = types.subst(deriveProduct.type.getParameterTypes().get(1),
-                deriveProduct.type.getTypeArguments(), com.sun.tools.javac.util.List.of(recordSym.type));
-        List<Type> inputs = descriptorInputs(encoderType);
-        if (inputs == null || inputs.size() != 2) {
-            return;
-        }
-        make.at(d.encoderPos());
-        Name out = names.fromString("out");
-        Name value = names.fromString("value");
-        ListBuffer<JCTree.JCStatement> body = new ListBuffer<>();
-        for (int i = 0; i < d.components().size(); i++) {
-            body.append(make.Exec(make.Apply(com.sun.tools.javac.util.List.nil(),
-                    make.Select(new TreeCopier<Void>(make).copy(d.typeClass()), names.fromString("deriveField")),
-                    com.sun.tools.javac.util.List.of(make.Ident(out), make.Literal(com.sun.tools.javac.code.TypeTag.INT, i),
-                            make.Apply(com.sun.tools.javac.util.List.nil(),
-                                    make.Select(make.Ident(value), d.components().get(i).name),
-                                    com.sun.tools.javac.util.List.nil())))));
-        }
-        JCLambda encoder = make.Lambda(com.sun.tools.javac.util.List.of(
-                        make.VarDef(make.Modifiers(Flags.PARAMETER), out, typeTree(inputs.get(0)), null),
-                        make.VarDef(make.Modifiers(Flags.PARAMETER), value, typeTree(inputs.get(1)), null)),
-                make.Block(0, body.toList()));
-        encoder.pos = d.encoderPos();
-        product.meth = make.Select(new TreeCopier<Void>(make).copy(d.typeClass()), deriveProduct.name);
-        product.args = product.args.tail.prepend(encoder).prepend(product.args.head);
-        trace("derives: specialized " + d.record().name + " for " + x + ": " + product);
-    }
-
-    private Type attribTypeQuietly(JCExpression tree, Env<AttrContext> env) {
-        JCTree copy = new TreeCopier<Void>(make).copy(tree);
-        Object saved = swapArgumentCache(new HashMap<>());
-        Log.DiagnosticHandler discard = log.new DiscardDiagnosticHandler();
-        try {
-            Type t = attr.attribType(copy, env.dup(copy));
-            return t == null || t.isErroneous() ? null : t;
-        } finally {
-            log.popDiagnosticHandler(discard);
-            swapArgumentCache(saved);
         }
     }
 
@@ -365,21 +280,21 @@ final class ImplicitResolver {
                 Name name = TreeInfo.name(call.meth);
                 Outcome outcome = Outcome.SKIPPED;
                 if (name == forjLower && call.args.size() == 1) {
-                    outcome = new CallSite(unit, getCurrentPath(), call).lower();
+                    outcome = new CallSite(unit, getCurrentPath(), call).lifting.lower();
                 } else if (name == forjLift && call.args.size() == 1 && call.meth instanceof com.sun.tools.javac.tree.JCTree.JCIdent) {
-                    outcome = new CallSite(unit, getCurrentPath(), call).liftKind();
+                    outcome = new CallSite(unit, getCurrentPath(), call).lifting.liftKind();
                 } else if (isUnpinnedStep(call, name)) {
                     outcome = new CallSite(unit, getCurrentPath(), call).pinTypeArguments();
                 } else {
                     if (extensionNames.contains(name) && call.meth instanceof JCFieldAccess) {
-                        outcome = new CallSite(unit, getCurrentPath(), call).extension(report);
+                        outcome = new Extensions(ImplicitResolver.this, new CallSite(unit, getCurrentPath(), call)).resolve(report);
                     }
                     if (outcome == Outcome.SKIPPED && usingMethodNames.contains(name)) {
                         outcome = new CallSite(unit, getCurrentPath(), call).complete(report);
                     }
                 }
                 if (outcome != Outcome.PENDING && kindMethodNames.contains(name) && narrowable(getCurrentPath())
-                        && new CallSite(unit, getCurrentPath(), call).narrow()) {
+                        && new CallSite(unit, getCurrentPath(), call).lifting.narrow()) {
                     outcome = Outcome.RESOLVED;
                 }
                 if (outcome != Outcome.SKIPPED || TRACE) {
@@ -421,7 +336,7 @@ final class ImplicitResolver {
         }
     }
 
-    private void indexMembers(ClassSymbol c) {
+    void indexMembers(ClassSymbol c) {
         for (Symbol m : c.members().getSymbols()) {
             if (m instanceof MethodSymbol method) {
                 if (usingCount(method) > 0) {
@@ -437,18 +352,23 @@ final class ImplicitResolver {
         }
     }
 
-    private boolean returnsKind(MethodSymbol m) {
+    boolean returnsKind(MethodSymbol m) {
         return kindSymbol != null && m.type.getReturnType().tsym == kindSymbol;
     }
 
     // ------------------------------------------------------------------ one call
 
-    private final class CallSite {
-        private final JCCompilationUnit unit;
-        private final JCMethodInvocation call;
-        private final Env<AttrContext> env;
+    /**
+     * One call, with what every rule needs: its scope, its arguments' types (type checked on
+     * copies), and the reporting mode. {@link Extensions} and {@link Lifting} work on it.
+     */
+    final class CallSite {
+        final JCCompilationUnit unit;
+        final JCMethodInvocation call;
+        final Env<AttrContext> env;
         private final JavacScope scope;
-        private final TreePath path;
+        final TreePath path;
+        final Lifting lifting;
 
         CallSite(JCCompilationUnit unit, TreePath path, JCMethodInvocation call) {
             this.unit = unit;
@@ -465,10 +385,11 @@ final class ImplicitResolver {
                 swapArgumentCache(saved);
             }
             this.env = scope.getEnv();
+            this.lifting = new Lifting(ImplicitResolver.this, this);
         }
 
         /** Local {@code given} variables declared before this call in its enclosing blocks. */
-        private List<Symbol> localGivens() {
+        List<Symbol> localGivens() {
             Set<Name> declared = new java.util.HashSet<>();
             Tree child = path.getLeaf();
             for (TreePath p = path.getParentPath(); p != null; child = p.getLeaf(), p = p.getParentPath()) {
@@ -542,7 +463,7 @@ final class ImplicitResolver {
                 return Outcome.RESOLVED;
             }
 
-            if (enabled(LIFT_ARGUMENTS) && liftArguments(method)) {
+            if (enabled(LIFT_ARGUMENTS) && lifting.liftArguments(method)) {
                 argTypes = null;   // the lifted arguments are Kinds now: infer from those
             }
             Map<TypeVar, Type> bindings = inferTypeArguments(method);
@@ -558,7 +479,7 @@ final class ImplicitResolver {
                 if (target != null && !target.isErroneous()) {
                     // a JDK target (Callable<User>) stands for the Kind its @Lower method takes, but only
                     // for methods returning a Kind: `<A> A decode(...)` into a List<String> means A = List<String>
-                    Lowering lowering = enabled(LIFT_RESULTS) && returnsKind(method) ? lowering(target) : null;
+                    Lifting.Lowering lowering = enabled(LIFT_RESULTS) && returnsKind(method) ? lifting.lowering(target) : null;
                     Map<TypeVar, Type> fromTarget = new HashMap<>();
                     unify(method.type.getReturnType(), lowering != null ? lowering.kind() : target, fromTarget, tvars);
                     fromTarget.forEach((tv, t) -> {
@@ -609,7 +530,7 @@ final class ImplicitResolver {
          * through a cast instead, {@code ((lib.Ords) null)}: a cast's type is resolved as a type,
          * which a variable never hides, and a static member can be called through it.
          */
-        private JCExpression owner(ClassSymbol c) {
+        JCExpression owner(ClassSymbol c) {
             JCExpression name = qualified(c);
             if (!(name instanceof JCFieldAccess)) {
                 return name;   // a top-level class in the unnamed package: no package to shadow
@@ -625,7 +546,7 @@ final class ImplicitResolver {
             return make.Parens(make.TypeCast(type, make.Literal(com.sun.tools.javac.code.TypeTag.BOT, null)));
         }
 
-        private static boolean isCastedNull(JCExpression e) {
+        static boolean isCastedNull(JCExpression e) {
             return e instanceof JCTree.JCParens p && p.expr instanceof JCTree.JCTypeCast cast
                     && cast.expr instanceof JCTree.JCLiteral literal && literal.typetag == com.sun.tools.javac.code.TypeTag.BOT;
         }
@@ -662,113 +583,8 @@ final class ImplicitResolver {
             }
         }
 
-        private boolean enabled(String feature) {
+        boolean enabled(String feature) {
             return features(unit).contains(feature);
-        }
-
-        /** liftArguments: wraps each JDK value passed where {@code method} expects a Kind. */
-        private boolean liftArguments(MethodSymbol method) {
-            ListBuffer<JCExpression> args = new ListBuffer<>();
-            boolean changed = false;
-            for (int i = 0; i < call.args.size(); i++) {
-                JCExpression arg = call.args.get(i);
-                Type type = argTypes().get(i);
-                Type declared = paramFor(method, i);
-                Type param = declared == null ? null : types.erasure(declared);
-                if (type != null && param != null && isKindType(param) && !types.isConvertible(type, param)) {
-                    JCExpression lifted = lift(arg, type);
-                    if (lifted != null) {
-                        arg = lifted;
-                        changed = true;
-                    }
-                }
-                args.append(arg);
-            }
-            if (changed) {
-                call.args = args.toList();
-            }
-            return changed;
-        }
-
-        private boolean isKindType(Type erased) {
-            return kindSymbol != null && types.asSuper(erased, kindSymbol) != null;
-        }
-
-        /**
-         * {@code expr} (of JDK type {@code type}) wrapped by the one {@code forjLift} overload
-         * that takes it, with explicit type arguments ({@code forj.For.<Integer>forjLift(xs)}),
-         * so javac doesn't treat it as a poly expression cached by position. Null when no
-         * overload takes it, or more than one does.
-         */
-        private JCExpression lift(JCExpression expr, Type type) {
-            if (type == null || type.isErroneous() || isKindType(type)) {
-                return null;
-            }
-            MethodSymbol found = null;
-            for (Symbol s : liftCandidates()) {
-                if (!(s instanceof MethodSymbol m) || m.params().size() != 1 || (m.flags() & Flags.STATIC) == 0) {
-                    continue;
-                }
-                Type param = types.erasure(m.type.getParameterTypes().head);
-                if (isKindType(param) || !types.isConvertible(type, param)) {
-                    continue;   // the identity overloads, or one for another type
-                }
-                if (found != null && found != m) {
-                    return null; // ambiguous: say, a class that is both a List and a Callable
-                }
-                found = m;
-            }
-            if (found == null) {
-                return null;
-            }
-            Map<TypeVar, Type> bindings = new HashMap<>();
-            List<Type> tvars = found.type.getTypeArguments();
-            unify(found.type.getParameterTypes().head, type, bindings, tvars);
-            ListBuffer<JCExpression> typeArgs = new ListBuffer<>();
-            for (Type tv : tvars) {
-                Type bound = bindings.get((TypeVar) tv);
-                if (bound == null) {
-                    return null;
-                }
-                typeArgs.append(typeTree(bound));
-            }
-            make.at(expr.pos);
-            return make.Apply(typeArgs.toList(), make.Select(owner((ClassSymbol) found.owner), found.name),
-                    com.sun.tools.javac.util.List.of(expr));
-        }
-
-        /** {@code forjLift} overloads in scope: forj's own and any statically imported. */
-        private Set<Symbol> liftCandidates() {
-            Set<Symbol> found = new LinkedHashSet<>();
-            if (forClass != null) {
-                forClass.members().getSymbolsByName(forjLift).forEach(found::add);
-            }
-            unit.namedImportScope.getSymbolsByName(forjLift).forEach(found::add);
-            unit.starImportScope.getSymbolsByName(forjLift).forEach(found::add);
-            return found;
-        }
-
-        /** How a JDK target type is reached from a Kind: its @Lower method, applied with these bindings. */
-        private record Lowering(MethodSymbol method, Type kind, Map<TypeVar, Type> bindings) {}
-
-        /** The @Lower method returning {@code target}'s type (Callable<User> from Kind<Callable, User>), if any. */
-        private Lowering lowering(Type target) {
-            if (target == null || target.isErroneous() || isKindType(target)) {
-                return null;
-            }
-            for (Symbol s : lowerCandidates()) {
-                if (!(s instanceof MethodSymbol m) || m.params().size() != 1
-                        || !types.isSameType(types.erasure(m.type.getReturnType()), types.erasure(target))) {
-                    continue;
-                }
-                Map<TypeVar, Type> bindings = new HashMap<>();
-                List<Type> tvars = m.type.getTypeArguments();
-                unify(m.type.getReturnType(), target, bindings, tvars);
-                if (tvars.stream().allMatch(tv -> bindings.containsKey((TypeVar) tv))) {
-                    return new Lowering(m, substitute(m.type.getParameterTypes().head, bindings), bindings);
-                }
-            }
-            return null;
         }
 
         /**
@@ -803,204 +619,11 @@ final class ImplicitResolver {
         }
 
         /**
-         * {@code x.name(args)} where {@code x}'s type has no method {@code name} but an extension
-         * method of that name takes {@code x}: becomes {@code Owner.name(x, args)}, whose
-         * {@code using} arguments the next pass fills in. Search order, nearest first: the
-         * enclosing classes, {@code import static}, the type classes of the givens in scope
-         * (local givens and the enclosing method's using parameters), the classes of the
-         * receiver's type and its type arguments, then {@code forj.Syntax}.
-         */
-        Outcome extension(boolean report) {
-            this.report = report;
-            var select = (JCFieldAccess) call.meth;
-            Name name = select.name;
-            if (call.typeargs.nonEmpty() || isCastedNull(select.selected)) {
-                return Outcome.SKIPPED;   // ((Owner) null).m(...) is a static call this resolver made
-            }
-            Type receiver = speculate(select.selected, false);
-            if (receiver == null || receiver.isErroneous()) {
-                Type asType = speculate(select.selected, true);
-                if (asType != null && !asType.isErroneous()) {
-                    return Outcome.SKIPPED;     // `Type.name(...)`: a static call
-                }
-                // not typed yet (say, the result of another extension call): try again next pass
-                return report ? Outcome.SKIPPED : Outcome.PENDING;
-            }
-            if (receiver.isPrimitive()) {
-                receiver = types.boxedClass(receiver).type;
-            }
-            Set<Symbol> own = new LinkedHashSet<>();
-            addMembers(types.skipTypeVars(receiver, false), name, own);
-            own.removeIf(m -> m instanceof MethodSymbol ms && isExtension(ms)); // e.g. declared in the receiver's record
-            if (!own.isEmpty()) {
-                return Outcome.SKIPPED;         // the type's own method wins, as in Scala
-            }
-            JCExpression liftedReceiver = null;
-            boolean liftable = enabled(LIFT_RECEIVERS) && (liftedReceiver = lift(select.selected, receiver)) != null;
-            for (List<MethodSymbol> level : extensionLevels(name, receiver)) {
-                Type r = receiver;
-                List<MethodSymbol> fits = level.stream().filter(m -> takesReceiver(m, r)).toList();
-                boolean lifted = false;
-                if (fits.isEmpty() && liftable) {
-                    // liftReceivers: a JDK value (List, Callable) for an extension on Kind
-                    fits = level.stream().filter(this::takesLiftedReceiver).toList();
-                    lifted = !fits.isEmpty();
-                }
-                if (fits.size() > 1) {
-                    return error(call, "ambiguous extension methods for " + name + ": "
-                            + fits.stream().map(ImplicitResolver::describe).toList());
-                }
-                if (fits.size() == 1) {
-                    MethodSymbol m = fits.getFirst();
-                    indexMembers((ClassSymbol) m.owner);   // its using parameters, if from a library
-                    make.at(select.pos);
-                    call.meth = make.Select(owner((ClassSymbol) m.owner), name);
-                    call.args = call.args.prepend(lifted ? liftedReceiver : select.selected);
-                    return Outcome.RESOLVED;
-                }
-            }
-            return Outcome.SKIPPED;             // javac reports the missing method
-        }
-
-        /** An extension method that can be called with the receiver and this call's arguments. */
-        private boolean takesReceiver(MethodSymbol m, Type receiver) {
-            int params = m.params().size();
-            int explicit = call.args.size() + 1;
-            if (params != explicit && params - usingCount(m) != explicit) {
-                return false;
-            }
-            return types.isConvertible(receiver, types.erasure(m.type.getParameterTypes().head));
-        }
-
-        /** An extension on Kind that takes this call's arguments, once the receiver is lifted. */
-        private boolean takesLiftedReceiver(MethodSymbol m) {
-            int params = m.params().size();
-            int explicit = call.args.size() + 1;
-            return (params == explicit || params - usingCount(m) == explicit)
-                    && isKindType(types.erasure(m.type.getParameterTypes().head));
-        }
-
-        private List<List<MethodSymbol>> extensionLevels(Name name, Type receiver) {
-            List<Set<Symbol>> levels = new ArrayList<>();
-            Set<Symbol> enclosing = new LinkedHashSet<>();
-            for (Env<AttrContext> e = env; e != null; e = e.outer) {
-                if (e.enclClass != null && e.enclClass.sym != null) {
-                    addMembers(e.enclClass.sym.type, name, enclosing);
-                }
-            }
-            levels.add(enclosing);
-            Set<Symbol> imported = new LinkedHashSet<>();
-            unit.namedImportScope.getSymbolsByName(name).forEach(imported::add);
-            unit.starImportScope.getSymbolsByName(name).forEach(imported::add);
-            levels.add(imported);
-            // like Scala's extensions on a given in scope: the type classes of the enclosing
-            // method's using parameters and of local givens (`a.show()` given a Show<A>)
-            Set<Symbol> inScope = new LinkedHashSet<>();
-            List<Symbol> givensInScope = new ArrayList<>(localGivens());
-            if (env.enclMethod != null && env.enclMethod.sym != null) {
-                env.enclMethod.sym.params().stream().filter(ImplicitResolver.this::isUsing).forEach(givensInScope::add);
-            }
-            for (Symbol g : givensInScope) {
-                addMembers(g.type, name, inScope);
-            }
-            levels.add(inScope);
-            Set<Symbol> companions = new LinkedHashSet<>();
-            addReceiverClasses(receiver, name, companions, new java.util.HashSet<>());
-            levels.add(companions);
-            Set<Symbol> defaults = new LinkedHashSet<>();
-            if (defaultSyntax != null) {
-                addMembers(defaultSyntax.type, name, defaults);
-            }
-            levels.add(defaults);
-            List<List<MethodSymbol>> result = new ArrayList<>();
-            for (Set<Symbol> level : levels) {
-                result.add(level.stream()
-                        .filter(s -> s instanceof MethodSymbol m && isExtension(m) && (m.flags() & Flags.STATIC) != 0
-                                && rs.isAccessible(env, m.owner.type, m))
-                        .map(s -> (MethodSymbol) s)
-                        .toList());
-            }
-            return result;
-        }
-
-        /** Extensions declared in the receiver type's classes and its type arguments' classes. */
-        private void addReceiverClasses(Type t, Name name, Set<Symbol> into, Set<Symbol> seen) {
-            t = types.skipTypeVars(t, false);
-            if (t == null || t.tsym == null || !seen.add(t.tsym)) {
-                return;
-            }
-            addMembers(t, name, into);
-            for (Type arg : t.getTypeArguments()) {
-                addReceiverClasses(arg instanceof WildcardType w ? w.type : arg, name, into, seen);
-            }
-        }
-
-        /**
-         * {@code forjLift(e)} where {@code e} already is a {@code Kind}: call the one identity
-         * method instead. With a generic {@code e} (say {@code either.fold(...)}) javac can't
-         * choose between the {@code forjLift} overloads.
-         */
-        Outcome liftKind() {
-            Type arg = argTypes().getFirst();
-            if (arg == null) {
-                return Outcome.PENDING;
-            }
-            if (types.asSuper(arg, kindSymbol) == null) {
-                return Outcome.SKIPPED;
-            }
-            make.at(call.meth.pos);
-            call.meth = make.Select(owner(forClass), names.fromString("forjKind"));
-            return Outcome.RESOLVED;
-        }
-
-        /**
-         * Wraps a call returning a {@code Kind} in {@code forj.For.forjNarrow(...)}, so its
-         * value can be assigned or returned as the type it stands for ({@code IO<Unit>}).
-         */
-        boolean narrow() {
-            Name name = TreeInfo.name(call.meth);
-            boolean returnsKind = false;
-            for (Symbol s : methodsNamed(name)) {
-                if (s instanceof MethodSymbol m && m.params().size() == call.args.size() && m.owner != forClass) {
-                    returnsKind |= returnsKind(m);   // forj's own plumbing is never narrowed
-                }
-            }
-            if (!returnsKind) {
-                return false;
-            }
-            make.at(call.meth.pos);
-            JCExpression wrapped = make.Apply(com.sun.tools.javac.util.List.nil(),
-                    make.Select(owner(forClass), names.fromString("forjNarrow")),
-                    com.sun.tools.javac.util.List.of(call));
-            Lowering lowering = enabled(LIFT_RESULTS) ? lowering(targetType()) : null;
-            if (lowering != null) {
-                // liftResults: a JDK target gets the value unwrapped, forj.For.<User>lowerCallable(call)
-                ListBuffer<JCExpression> typeArgs = new ListBuffer<>();
-                for (Type tv : lowering.method().type.getTypeArguments()) {
-                    typeArgs.append(typeTree(lowering.bindings().get((TypeVar) tv)));
-                }
-                make.at(call.meth.pos);
-                wrapped = make.Apply(typeArgs.toList(),
-                        make.Select(owner((ClassSymbol) lowering.method().owner), lowering.method().name),
-                        com.sun.tools.javac.util.List.of(call));
-            }
-            switch (path.getParentPath().getLeaf()) {
-                case JCVariableDecl v -> v.init = wrapped;
-                case JCReturn r -> r.expr = wrapped;
-                case JCAssign a -> a.rhs = wrapped;
-                default -> {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        /**
          * The type the call's value goes into, if its context says: a typed local variable, a
          * return from the enclosing method, or an assignment. Used to infer type parameters
          * that only the result mentions ({@code IO<Unit> app = checkout(cart);} gives F = IO).
          */
-        private Type targetType() {
+        Type targetType() {
             TreePath parent = path.getParentPath();
             if (parent.getLeaf() instanceof JCMethodInvocation wrapper
                     && TreeInfo.name(wrapper.meth).contentEquals("forjNarrow")) {
@@ -1145,65 +768,10 @@ final class ImplicitResolver {
             return t == null || t.isErroneous() ? null : t;
         }
 
-        /**
-         * {@code forjLower(k)} where {@code k} is a {@code Kind<W, A>} for a concrete witness
-         * {@code W} with a {@code @Lower} method: call that method instead, so the result is a
-         * plain {@code List<A>}, {@code Optional<A>}, ... rather than a {@code Kind}.
-         */
-        Outcome lower() {
-            Type arg = argTypes().getFirst();
-            if (arg == null) {
-                return Outcome.PENDING;
-            }
-            Type kind = kindSymbol == null ? null : types.asSuper(arg, kindSymbol);
-            if (kind == null || kind.getTypeArguments().isEmpty()) {
-                return Outcome.SKIPPED;
-            }
-            Type witness = kind.getTypeArguments().head;
-            if (witness instanceof TypeVar) {
-                return Outcome.SKIPPED; // generic F: the identity forjLower is right
-            }
-            for (Symbol s : lowerCandidates()) {
-                if (s instanceof MethodSymbol m && m.params().size() == 1) {
-                    Type param = types.asSuper(m.type.getParameterTypes().head, kindSymbol);
-                    if (param != null && param.getTypeArguments().nonEmpty()
-                            && types.isSameType(types.erasure(param.getTypeArguments().head), types.erasure(witness))) {
-                        make.at(call.meth.pos);
-                        call.meth = make.Select(owner((ClassSymbol) m.owner), m.name);
-                        return Outcome.RESOLVED;
-                    }
-                }
-            }
-            return Outcome.SKIPPED;
-        }
-
-        private List<Symbol> lowerCandidates() {
-            List<Symbol> found = new ArrayList<>();
-            if (lowerAnnotation == null) {
-                return found;
-            }
-            List<Symbol> scope = new ArrayList<>();
-            if (forClass != null) {
-                forClass.members().getSymbols().forEach(scope::add);
-            }
-            unit.namedImportScope.getSymbols().forEach(scope::add);
-            for (Symbol s : unit.starImportScope.getSymbols()) {
-                if (s.kind == Kind.MTH) {
-                    scope.add(s);
-                }
-            }
-            for (Symbol s : scope) {
-                if (s.kind == Kind.MTH && s.attribute(lowerAnnotation) != null) {
-                    found.add(s);
-                }
-            }
-            return found;
-        }
-
-        private List<Type> argTypes;
+        List<Type> argTypes;
 
         /** Argument types, type checked once on copies; null where unknown (e.g. lambdas). */
-        private List<Type> argTypes() {
+        List<Type> argTypes() {
             if (argTypes == null) {
                 argTypes = new ArrayList<>();
                 for (JCExpression arg : call.args) {
@@ -1229,7 +797,7 @@ final class ImplicitResolver {
                 }
                 Type param = types.erasure(declared);
                 if (arg != null && !types.isConvertible(arg, param)
-                        && !(lifting && isKindType(param) && lift(call.args.get(i), arg) != null)) {
+                        && !(lifting && this.lifting.isKindType(param) && this.lifting.lift(call.args.get(i), arg) != null)) {
                     return false;
                 }
             }
@@ -1238,7 +806,7 @@ final class ImplicitResolver {
 
         // ------------------------------------------------- which methods could this be?
 
-        private Set<Symbol> methodsNamed(Name name) {
+        Set<Symbol> methodsNamed(Name name) {
             return methodsNamed(call.meth, name);
         }
 
@@ -1276,7 +844,7 @@ final class ImplicitResolver {
             return found;
         }
 
-        private void addMembers(Type site, Name name, Set<Symbol> into) {
+        void addMembers(Type site, Name name, Set<Symbol> into) {
             for (Type t : types.closure(site)) {
                 for (Symbol s : t.tsym.members().getSymbolsByName(name)) {
                     if (s.kind == Kind.MTH) {
@@ -1355,7 +923,7 @@ final class ImplicitResolver {
          * to, skipping using parameters; for the varargs part, the element type (or the array,
          * when one is passed as is). Null when there is none.
          */
-        private Type paramFor(MethodSymbol m, int i) {
+        Type paramFor(MethodSymbol m, int i) {
             List<Type> ordinary = new ArrayList<>();
             List<VarSymbol> params = m.params();
             List<Type> declared = m.type.getParameterTypes();
@@ -1412,7 +980,7 @@ final class ImplicitResolver {
         }
 
         /** Type checks a copy of {@code tree} in this call's scope, reporting nothing. */
-        private Type speculate(JCTree tree, boolean asType) {
+        Type speculate(JCTree tree, boolean asType) {
             JCTree copy = new TreeCopier<Void>(make).copy(tree);
             Env<AttrContext> scratch = env.dup(copy); // env is getScope's private copy already
             var discard = TRACE ? log.new DeferredDiagnosticHandler() : log.new DiscardDiagnosticHandler();
@@ -1433,10 +1001,10 @@ final class ImplicitResolver {
             }
         }
 
-        private boolean report;
+        boolean report;
 
         /** Reports in the final pass; earlier passes just wait for more types to be known. */
-        private Outcome error(JCTree at, String message) {
+        Outcome error(JCTree at, String message) {
             if (!report) {
                 return Outcome.PENDING;
             }
@@ -1614,7 +1182,7 @@ final class ImplicitResolver {
      * resolver attributes in half-resolved code must not end up in the cache the real
      * attribution uses, so each such attribution runs against its own cache.
      */
-    private Object swapArgumentCache(Object cache) {
+    Object swapArgumentCache(Object cache) {
         try {
             Object previous = argumentCache.get(argumentAttr);
             argumentCache.set(argumentAttr, cache);
@@ -1645,7 +1213,7 @@ final class ImplicitResolver {
     // ------------------------------------------------------------------- types
 
     /** Parameter types of a functional interface type's method, wildcards replaced by their bounds. */
-    private List<Type> descriptorInputs(Type functional) {
+    List<Type> descriptorInputs(Type functional) {
         if (!(functional.tsym instanceof ClassSymbol c) || !c.isInterface()) {
             return null;
         }
@@ -1683,7 +1251,7 @@ final class ImplicitResolver {
     }
 
     /** Binds type variables of {@code pattern} so it matches {@code actual} (one-sided, best effort). */
-    private void unify(Type pattern, Type actual, Map<TypeVar, Type> bindings, List<Type> tvars) {
+    void unify(Type pattern, Type actual, Map<TypeVar, Type> bindings, List<Type> tvars) {
         if (pattern instanceof TypeVar v && tvars.contains(v)) {
             bindings.putIfAbsent(v, actual.isPrimitive() ? types.boxedClass(actual).type : actual);
             return;
@@ -1717,7 +1285,7 @@ final class ImplicitResolver {
         }
     }
 
-    private Type substitute(Type t, Map<TypeVar, Type> bindings) {
+    Type substitute(Type t, Map<TypeVar, Type> bindings) {
         ListBuffer<Type> from = new ListBuffer<>();
         ListBuffer<Type> to = new ListBuffer<>();
         bindings.forEach((k, v) -> {
@@ -1761,15 +1329,15 @@ final class ImplicitResolver {
         return (s.kind == Kind.VAR || s.kind == Kind.MTH) && s.attribute(givenAnnotation) != null;
     }
 
-    private boolean isUsing(VarSymbol p) {
+    boolean isUsing(VarSymbol p) {
         return p.attribute(usingAnnotation) != null;
     }
 
-    private boolean isExtension(MethodSymbol m) {
+    boolean isExtension(MethodSymbol m) {
         return extensionAnnotation != null && m.attribute(extensionAnnotation) != null;
     }
 
-    private int usingCount(MethodSymbol m) {
+    int usingCount(MethodSymbol m) {
         int n = 0;
         for (VarSymbol p : m.params()) {
             if (isUsing(p)) {
@@ -1817,7 +1385,7 @@ final class ImplicitResolver {
      * A type written out as source would write it, with no symbols attached, so javac
      * attributes it like hand-written code ({@code TreeMaker.Type} pre-attributes its trees).
      */
-    private JCExpression typeTree(Type t) {
+    JCExpression typeTree(Type t) {
         if (t instanceof ArrayType a) {
             return make.TypeArray(typeTree(a.elemtype));
         }
@@ -1848,7 +1416,7 @@ final class ImplicitResolver {
         return e;
     }
 
-    private static String describe(Symbol s) {
+    static String describe(Symbol s) {
         return s.owner.getSimpleName() + "." + s.getSimpleName();
     }
 }
