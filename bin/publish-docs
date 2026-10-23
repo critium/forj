@@ -4,7 +4,7 @@
 # - README.md is the front page, and PAGES come along (GitHub Pages renders the markdown with
 #   Jekyll; links between .md files keep working);
 # - each module's javadoc sits under its path (MODULES);
-# - every README page has a tab bar linking to them, and every page loads the site's shared nav
+# - every README page has a tab bar linking to them and to each folder in PAGES, and every page loads the site's shared nav
 #   bar (/nav.js), which links critium and all the projects.
 #
 #   bin/publish-docs            builds the site into a temp dir and prints where; pushes nothing
@@ -88,6 +88,11 @@ done
 # Jekyll lays out the markdown with this; javadoc's HTML has no front matter, so it is served
 # as it is
 tabs='<a href="{{ site.baseurl }}/"{% if page.url == "/" %} class="active"{% endif %}>README.md</a>'
+for page in "${PAGES[@]}"; do
+  if [ -d "$page" ]; then   # a folder of guides (docs/): its index
+    tabs+=" <a href=\"{{ site.baseurl }}/$page/\"{% if page.url contains \"/$page/\" %} class=\"active\"{% endif %}>$page</a>"
+  fi
+done
 for m in "${MODULES[@]}"; do
   path="${m#*:}"
   tabs+=" <a href=\"{{ site.baseurl }}/$path/\">$path</a>"

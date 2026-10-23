@@ -316,4 +316,4 @@ This is an experiment. It works and is tested, but:
 
 ## License
 
-Apache License 2.0; see [LICENSE](LICENSE). Contributions are accepted under the same license.
+Apache License 2.0; see [LICENSE](https://github.com/critium/forj/blob/main/LICENSE). Contributions are accepted under the same license.
