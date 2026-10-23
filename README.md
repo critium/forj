@@ -18,100 +18,36 @@ findUser(name).flatMap(user ->
         findAddress(manager).map(address -> address.city())));
 ```
 
-Comprehensions run on real type classes: a block over `F` needs a `Monad<F>`, found at
-compile time like any other `given`. Instances for `Optional`, `List`, `Callable` and forj's
-own `IO` are built in, and the same block works for any `F`, including a type parameter.
-`forj.Par` adds parallel calls on structured concurrency, in the style of cats-effect's
-`parMapN`.
+## What's in it
 
-It also brings Scala 3's `given`/`using`: type classes and context parameters, resolved at
-compile time:
+**<ins>Comprehensions</ins>** with generators, `guard` filters, value definitions and `_ <-`,
+over any `F` with a `Monad<F>`: `Optional`, `List`, `Callable`, forj's `IO`, or a type
+parameter.
 
-```java
-public interface Show<A> {
-    String show(A a);
-    given Show<Integer> integer = i -> Integer.toString(i);
-    given <A> Show<List<A>> list(using Show<A> element) { ... }
-    extension <A> String show(A a)(using Show<A> s) { return s.show(a); }
-}
-
-List.of(1, 2).show();   // with import static Show.*: Show.show(List.of(1, 2), Show.list(Show.integer)); no instance, no build
-```
-
-Extension methods also give the type classes cats-style syntax on any `F`, with no imports:
-`fa.map(f)`, `fa.flatMap(f)`, `fa.handleErrorWith(h)`, `fa.race(fb)`, `a.combine(b)`.
-
-Records can derive instances: `record User(long id, String name) derives Codec { }` adds a
-`given Codec<User>` built from the components, through a convention any type class can follow
-(see the Java guide, "Deriving instances").
-
-Callers can still pass an instance themselves (`Show.show(xs)(using hexShow)`). For code that
-must parse in any Java editor, `@Using`/`@Given` annotations do the same as the keywords.
-
-And Scala's string interpolation:
+**<ins>`given` and `using`</ins>**: Scala 3 type classes and context parameters, resolved at
+compile time.
 
 ```java
-s"Hi $name, you owe ${total / 100}"        // "Hi " + name + ", you owe " + (total / 100)
-f"$item%-10s $price%8.2f"                  // String.format("%-10s %8.2f", item, price)
-raw"C:\temp\$file"                         // backslashes stay backslashes
+given Show<Integer> integer = i -> Integer.toString(i);
+static <A> String show(A a)(using Show<A> s) { return s.show(a); }
 ```
 
-## Want to dig deeper but not too deep?
+**<ins>Extension methods</ins>**: `fa.map(f)`, `fa.flatMap(f)`, `fa.race(fb)` on any `F`.
+
+**<ins>Derived instances</ins>**: `record User(long id, String name) derives Codec { }`.
+
+**<ins>Higher-kinded types</ins>**: `F<_>` type parameters and the cats-effect 2 ladder, for
+tagless final.
+
+**<ins>Parallel calls</ins>**: `forj.Par`, `parMapN`-style, on structured concurrency.
+
+**<ins>String interpolation</ins>**: `s"Hi $name"`, `f"$price%.2f"`, `raw"C:\$file"`.
+
+## Want to dig deeper?
 - New to comprehensions? Read [docs/java-developers.md](docs/java-developers.md).
 - Coming from Scala? Read [docs/scala-developers.md](docs/scala-developers.md).
 - API reference: [javadoc for forj-core](https://critium.github.io/forj/api/), and the
   [examples](https://critium.github.io/forj/examples/).
-
-## Higher-kinded types, the CE2 ladder and tagless final
-
-Write `F<_>` for a type parameter that takes a type, and program against capabilities the way
-cats-effect 2 does:
-
-```java
-public interface Inventory<F<_>> {                       // an algebra, in any effect F
-    F<Integer> stock(String item);
-    F<Unit> reserve(String item, int quantity);
-}
-
-public static <F<_>> F<Receipt> checkout(Order order)(using Sync<F> sync, Inventory<F> inventory, Payments<F> payments) {
-    return forj {
-        available <- inventory.stock(order.item());
-        _ <- available >= order.quantity() ? sync.unit() : sync.<Unit>raiseError(new OutOfStock(...));
-        _ <- inventory.reserve(order.item(), order.quantity());
-        transaction <- payments.charge(order.customer(), order.totalCents());
-    } yield new Receipt(order, transaction);
-}
-
-given Inventory<IO> inventory = new Live.Warehouse(stock);
-given Payments<IO> payments = new Live.Bank();
-IO<Receipt> program = checkout(order);                  // F = IO, from the target type
-Receipt receipt = program.unsafeRunSync();              // nothing ran until here
-```
-
-The ladder is `Functor` → `Applicative` → `Monad` → `MonadError` → `Bracket` → `Sync` →
-`Async` → `Concurrent`, plus `Effect` and `ConcurrentEffect` for effects that can be run at
-the edge (`effect.unsafeRunSync(fa)`, what a server does with each request). `IO` is lazy and stack safe, and runs on virtual threads, with fibers,
-`race` and `parMap2` on structured concurrency. A function asks for the least it needs, and
-asking for more than an effect has is a compile error:
-`forj: no given forj.typeclass.Concurrent<java.util.concurrent.Callable>`.
-The runnable version is in `examples/.../tagless/`.
-
-JDK types (`Callable`, `List`, `Optional`) aren't a `Kind`, so they're wrapped to take part.
-Opt-in lifting does that for you, per file: with `import static forj.Language.lifting;`,
-`Callable<User> u = decodeF(bytes);`, `xs.map(f)` and `addBoth(callableA, callableB)` work as
-written (see the Java guide, "Automatic lifting").
-
-## Syntax at a glance
-
-```java
-List<String> labels = forj {
-    rank <- List.of(1, 2, 3, 4);       // generator
-    guard(rank % 2 == 0);              // filter on the generator above
-    var label = rank == 4 ? "K" : String.valueOf(rank);   // value definition
-    suit <- List.of("♠", "♥");
-    _ <- List.of(1);                   // bind and discard
-} yield label + suit;                  // the result
-```
 
 ## How it works
 
@@ -132,8 +68,9 @@ List<String> labels = forj {
    parameters, searches for a `given` of each required type (recursively, for givens that
    have `using` parameters of their own), and inserts it. No match, or two, fails the build.
 
-The runtime library is small: `forj.For` holds the monad instances for JDK types and a
-one-line `run` helper, and `forj.Par` holds the parallel combinators.
+The runtime library is small: `forj.For` holds what comprehensions call, `forj.Instances`
+the instances for JDK types, `forj.Syntax` the default extension methods, and `forj.Par` the
+parallel combinators.
 
 ## Building
 
